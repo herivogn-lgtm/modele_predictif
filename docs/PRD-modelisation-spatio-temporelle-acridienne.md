@@ -123,6 +123,16 @@ Toutes les features dynamiques sont agrégées par statistique zonale (moyenne, 
 - **Pas de split aléatoire** — data leakage sur séries temporelles.
 - Campagnes 2023–24 : exclues des labels (features GEE disponibles pour inférence uniquement).
 
+### Rapport de performance (pipeline #10)
+
+Notebook Jupyter `notebooks/10_rapport_performance.ipynb` — consolidation de toutes les métriques walk-forward et analyse du biais de détection :
+
+- **Métriques par fold** : fusion de `07_rapport_walk_forward.csv` et `08_rapport_walk_forward.csv` sur `campagne_calc` ; colonnes : AUC-ROC, F1, précision, rappel (présence/absence), RMSE densité, F1-macro phase, rappel grégaire. Ligne GLOBAL poolée séparée.
+- **Courbe temporelle** : évolution de chaque métrique par campagne de validation (2016-17 → fin de la fenêtre labellisée), avec lignes de cible (AUC ≥ 0,85 ; rappel_G ≥ 0,70).
+- **Biais de détection** : corrélation effort de prospection × taux de présence par région naturelle × campagne (scatter + barplot par quartile d'effort). Diagnostic de sous-détection dans les zones peu prospectées.
+- **Comparaison SIG-LMC** : section conditionnelle — active si `data/sig_lmc/*.csv` est présent (format : `AIRE_CODE`, `campagne_calc`, `niveau_risque_siglmc` int 0–4) ; calcule matrice de confusion 5×5, accord exact, accord ±1 niveau, Cohen's kappa.
+- **Sortie graphique** : `data/processed/10_courbe_performance.png`.
+
 ---
 
 ## Testing Decisions
