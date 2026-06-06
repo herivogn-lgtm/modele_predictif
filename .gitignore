@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Data files (large or sensitive)
+data/*.xls
+data/*.xlsx
+data/*.csv
+data/*.gpkg
+data/*.geojson
+
+# Shapefiles (keep structure, ignore binaries if large)
+# Uncomment if shapefiles are too large for git:
+# data/**/*.shp
+# data/**/*.dbf
+# data/**/*.shx
+# data/**/*.prj
+
+data
+
+.agents
+
+# PDFs
+data/*.pdf
+docs/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output / scratch
+output/
+exports/
+scratch/
+tmp/
+*.log

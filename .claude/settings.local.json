@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import pymupdf; print\\('ok'\\)\")",
+      "Bash(python -c \"import fitz; print\\('ok'\\)\")",
+      "Bash(python -c \"import pypdf; print\\('ok'\\)\")",
+      "Bash(pip list *)",
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(python *)"
+    ]
+  }
+}
