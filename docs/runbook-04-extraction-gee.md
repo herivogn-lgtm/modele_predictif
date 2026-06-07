@@ -2,7 +2,7 @@
 
 Pipeline : `src/04_extraction_variables_gee.py`  
 Sortie : `data/processed/04_variables_environnementales.parquet`  
-Durée estimée : 2–3 h (run complet 2001–2026)
+Durée estimée : ~10–20 min (run complet 2001–2026, réduction batch côté serveur + getInfo parallélisés)
 
 ---
 
@@ -95,16 +95,24 @@ print("NaN NDVI :", df["ndvi_mean"].isna().mean())
 EOF
 ```
 
-### Étape 4 — Run complet 2001–2026 (2–3 h)
+### Étape 4 — Run complet 2001–2026 (~10–20 min)
 
 ```bash
 python src/04_extraction_variables_gee.py
 ```
 
-Le script affiche sa progression décade par décade :
+Le script affiche sa progression par **source** (chaque source est réduite côté
+serveur sur une ImageCollection, avec un getInfo par année parallélisé) :
 ```
-[1/750] 2001-02 décade 01 (2001-10-01 → 2001-10-10) OK
-[2/750] 2001-02 décade 02 (2001-10-11 → 2001-10-20) OK
+Extraction dynamique (années 2001–2026)
+  CHIRPS : 26 années × 6 workers...
+    CHIRPS OK (70200 lignes)
+  NDVI/EVI : 26 années × 6 workers...
+    NDVI/EVI OK (70200 lignes)
+  LST : 26 années × 6 workers...
+    LST OK (70200 lignes)
+  ERA5 humidité sol : 26 années...
+  Occupation du sol (MODIS) : toutes années...
 ...
 ```
 

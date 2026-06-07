@@ -5,6 +5,12 @@ naturelles pour chaque décade de campagne acridienne 2001–2026. Sources : CHI
 pluviométrie + anomalie, MODIS NDVI/EVI/LST, ERA5 humidité du sol, MODIS occupation
 du sol, OpenLandMap texture du sol, SRTM DEM, NOAA ENSO/ONI.
 
+Architecture : la réduction décadaire est mappée **côté serveur** sur une
+ImageCollection (1 getInfo par source × année au lieu de ~6 par décade), ce qui
+réduit drastiquement le nombre de round-trips GEE. La logique pure (calendrier,
+specs, assemblage, anomalie, garde-fous) vit dans `extraction_gee_helpers` et est
+testée unitairement sans dépendance GEE.
+
 Sortie : data/processed/04_variables_environnementales.parquet
 
 Usage :
@@ -14,16 +20,14 @@ Usage :
 """
 
 import argparse
-import calendar
 import sys
 import time
-from datetime import date, timedelta
-from io import StringIO
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
 
 import ee
 import geopandas as gpd
-import numpy as np
 import pandas as pd
 import requests
 
@@ -41,73 +45,26 @@ from config_gee import (
     MODIS_NDVI_EVI,
     OLM_CLAY,
     OLM_SAND,
-    OLM_SILT,
     PATHS,
     RETRY_BACKOFF_BASE,
     YEARS,
 )
+from extraction_gee_helpers import (
+    assemble_decades,
+    assert_decade_completeness,
+    build_decade_calendar,
+    build_specs,
+    compute_chirps_anomaly,
+    decade_bounds,
+    parse_reduce_features,
+)
 
-# Mois de la campagne acridienne : octobre–juillet
-CAMPAIGN_MONTHS = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7]
-
-
-# ── 1. Calendrier décadaire ────────────────────────────────────────────────────
-
-def decade_bounds(year: int, month: int, part: int) -> tuple[date, date]:
-    """Retourne (date_start, date_end) pour la décade (year, month, part∈{1,2,3})."""
-    if part == 1:
-        start, end = date(year, month, 1), date(year, month, 10)
-    elif part == 2:
-        start, end = date(year, month, 11), date(year, month, 20)
-    else:
-        last = calendar.monthrange(year, month)[1]
-        start, end = date(year, month, 21), date(year, month, last)
-    return start, end
+# Nombre de getInfo concurrents (GEE sert les requêtes en parallèle ; getInfo est
+# thread-safe côté client). Borne raisonnable pour ne pas saturer le quota.
+GETINFO_MAX_WORKERS = 6
 
 
-def _campaign_label(year: int, month: int) -> str | None:
-    if month >= 10:
-        return f"{year}-{year + 1}"
-    if 1 <= month <= 7:
-        return f"{year - 1}-{year}"
-    return None  # août-septembre : hors campagne
-
-
-def build_decade_calendar(years: list[int]) -> pd.DataFrame:
-    """Génère toutes les décades de campagne pour les années civiles données.
-
-    Chaque ligne représente une décade avec ses métadonnées temporelles.
-    Retourne uniquement les décades des mois de campagne (oct–jul).
-    """
-    records = []
-    for year in years:
-        for month in CAMPAIGN_MONTHS:
-            campaign = _campaign_label(year, month)
-            if campaign is None:
-                continue
-            # Numéro de mois dans la campagne (oct=1 … jul=10)
-            month_offset = CAMPAIGN_MONTHS.index(month) + 1
-            for part in (1, 2, 3):
-                d_start, d_end = decade_bounds(year, month, part)
-                decade_num = (month_offset - 1) * 3 + part
-                records.append({
-                    "year": year,
-                    "month": month,
-                    "decade_part": part,
-                    "date_start": d_start,
-                    "date_end": d_end,
-                    "midpoint": d_start + timedelta(days=(d_end - d_start).days // 2),
-                    "campaign": campaign,
-                    "decade_num": decade_num,
-                })
-    df = pd.DataFrame(records)
-    df["date_start"] = pd.to_datetime(df["date_start"])
-    df["date_end"] = pd.to_datetime(df["date_end"])
-    df["midpoint"] = pd.to_datetime(df["midpoint"])
-    return df
-
-
-# ── 2. Chargement des régions ──────────────────────────────────────────────────
+# ── 1. Chargement des régions ──────────────────────────────────────────────────
 
 def load_regions(shp_path: Path) -> tuple[gpd.GeoDataFrame, ee.FeatureCollection]:
     """Charge le shapefile et construit la FeatureCollection GEE inline (sans upload)."""
@@ -127,7 +84,15 @@ def load_regions(shp_path: Path) -> tuple[gpd.GeoDataFrame, ee.FeatureCollection
     return gdf, fc
 
 
-# ── 3. Utilitaires GEE ────────────────────────────────────────────────────────
+def regions_table(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+    """DataFrame (region_id, region_nom) servant de base à l'assemblage."""
+    return pd.DataFrame({
+        "region_id": gdf["rn_num"].astype(int).tolist(),
+        "region_nom": gdf["rn_nom"].tolist(),
+    })
+
+
+# ── 2. Utilitaires GEE ────────────────────────────────────────────────────────
 
 def gee_call_with_retry(fn):
     """Exécute fn() avec retry exponentiel sur EEException (rate limit / 5xx)."""
@@ -143,96 +108,268 @@ def gee_call_with_retry(fn):
     raise last_exc
 
 
-def _collection_empty(collection: ee.ImageCollection) -> bool:
-    return gee_call_with_retry(lambda: collection.size().getInfo()) == 0
+# Réducteur statistique commun : moyenne + écart-type + min/max.
+# Construit paresseusement : ee.Reducer.* nécessite que GEE soit initialisé,
+# ce qui n'est pas le cas à l'import du module.
+_STATS_REDUCER = None
+
+
+def stats_reducer():
+    global _STATS_REDUCER
+    if _STATS_REDUCER is None:
+        _STATS_REDUCER = (
+            ee.Reducer.mean()
+            .combine(ee.Reducer.stdDev(), sharedInputs=True)
+            .combine(ee.Reducer.minMax(), sharedInputs=True)
+        )
+    return _STATS_REDUCER
 
 
 def reduce_regions(image: ee.Image, fc: ee.FeatureCollection, scale: int) -> list[dict]:
-    """Calcule mean/stdDev/min/max par région et retourne une liste de dicts."""
-    reducer = (
-        ee.Reducer.mean()
-        .combine(ee.Reducer.stdDev(), sharedInputs=True)
-        .combine(ee.Reducer.minMax(), sharedInputs=True)
-    )
+    """mean/stdDev/min/max par région (sources statiques mono-image)."""
     result = gee_call_with_retry(
         lambda: image.reduceRegions(
-            collection=fc,
-            reducer=reducer,
-            scale=scale,
-            crs="EPSG:4326",
+            collection=fc, reducer=stats_reducer(), scale=scale, crs="EPSG:4326",
         ).getInfo()
     )
     return [f["properties"] for f in result["features"]]
 
 
-def reduce_regions_mode(image: ee.Image, fc: ee.FeatureCollection, scale: int) -> list[dict]:
-    """Calcule le mode par région (pour les données catégorielles)."""
-    result = gee_call_with_retry(
-        lambda: image.reduceRegions(
-            collection=fc,
-            reducer=ee.Reducer.mode(),
-            scale=scale,
-            crs="EPSG:4326",
-        ).getInfo()
-    )
-    return [f["properties"] for f in result["features"]]
-
-
-def _props_to_df(props_list: list[dict], id_key: str = "region_id") -> pd.DataFrame:
-    """Convertit la liste de propriétés GEE en DataFrame avec region_id."""
+def _props_to_df(props_list: list[dict]) -> pd.DataFrame:
+    """Convertit une liste de propriétés GEE en DataFrame (sans region_nom)."""
     df = pd.DataFrame(props_list)
-    if id_key not in df.columns:
+    if "region_id" not in df.columns:
         return pd.DataFrame()
-    return df[[c for c in df.columns if c not in ("region_nom",) or c == id_key]]
+    return df[[c for c in df.columns if c != "region_nom"]]
 
 
-# ── 4. Extraction CHIRPS ───────────────────────────────────────────────────────
+# ── 3. Réduction décadaire batch (côté serveur) ───────────────────────────────
 
-def _chirps_sum_image(year: int, month: int, part: int) -> ee.Image | None:
-    """Somme des précipitations CHIRPS journalières sur la décade."""
-    d_start, d_end = decade_bounds(year, month, part)
+def _safe_image(real: ee.Image, dummy: ee.Image, coll: ee.ImageCollection, key_val) -> ee.Image:
+    """Renvoie `real` si la collection est non vide, sinon `dummy` (masqué).
+
+    Garantit un schéma de bandes stable même décade vide → la réduction renvoie
+    null → NaN après assemblage. Remplace l'ancienne sonde `_collection_empty`
+    (un getInfo par décade) par une condition côté serveur.
+    """
+    img = ee.Image(ee.Algorithms.If(coll.size().gt(0), real, dummy))
+    return img.set("decade_id", key_val)
+
+
+def _chirps_image(spec: dict) -> ee.Image:
     coll = (
         ee.ImageCollection(CHIRPS_COLLECTION)
-        .filterDate(
-            d_start.strftime("%Y-%m-%d"),
-            (d_end + timedelta(days=1)).strftime("%Y-%m-%d"),
-        )
+        .filterDate(spec["start"], spec["end"])
         .select("precipitation")
     )
-    if _collection_empty(coll):
-        return None
-    return coll.sum()
+    real = coll.sum().rename("chirps_sum")
+    dummy = ee.Image.constant(0).rename("chirps_sum").updateMask(0)
+    return _safe_image(real, dummy, coll, spec["id"])
 
 
-def extract_chirps_sum(fc: ee.FeatureCollection, year: int, month: int, part: int) -> pd.DataFrame:
-    """Somme décadaire CHIRPS par région (mm). NaN si pas de données."""
-    img = _chirps_sum_image(year, month, part)
-    if img is None:
-        return pd.DataFrame(columns=["region_id", "chirps_sum_mean", "chirps_sum_min",
-                                     "chirps_sum_max", "chirps_sum_std"])
-    props = reduce_regions(img.rename("chirps_sum"), fc, scale=5566)
-    df = _props_to_df(props)
-    # GEE retourne mean/stdDev/min/max sans préfixe pour les images mono-bande
-    df = df.rename(columns={
-        "mean": "chirps_sum_mean",
-        "stdDev": "chirps_sum_std",
-        "min": "chirps_sum_min",
-        "max": "chirps_sum_max",
-    })
-    keep = [c for c in ["region_id", "chirps_sum_mean", "chirps_sum_min",
-                        "chirps_sum_max", "chirps_sum_std"] if c in df.columns]
-    return df[keep]
+def _apply_modis_ndvi_qa(image: ee.Image) -> ee.Image:
+    """Masque les pixels de faible qualité de MOD13A2 (bits 0-1 de DetailedQA > 1)."""
+    qa = image.select("DetailedQA")
+    return image.updateMask(qa.bitwiseAnd(3).lte(1))
 
+
+def _ndvi_evi_image(spec: dict) -> ee.Image:
+    coll = (
+        ee.ImageCollection(MODIS_NDVI_EVI)
+        .filterDate(spec["start"], spec["end"])
+        .map(_apply_modis_ndvi_qa)
+        .select(["NDVI", "EVI"])
+    )
+    real = coll.sort("system:time_start", False).first().multiply(0.0001)
+    dummy = ee.Image.constant([0, 0]).rename(["NDVI", "EVI"]).updateMask(0)
+    return _safe_image(real, dummy, coll, spec["id"])
+
+
+def _apply_modis_lst_qa(image: ee.Image) -> ee.Image:
+    """Masque les pixels de faible qualité de MOD11A2 (bits 0-1 de QC_Day != 0)."""
+    qa = image.select("QC_Day")
+    return image.updateMask(qa.bitwiseAnd(3).eq(0))
+
+
+def _lst_image(spec: dict) -> ee.Image:
+    coll = (
+        ee.ImageCollection(MODIS_LST)
+        .filterDate(spec["start"], spec["end"])
+        .map(_apply_modis_lst_qa)
+        .select("LST_Day_1km")
+    )
+    real = coll.sort("system:time_start", False).first().multiply(0.02).rename("lst")
+    dummy = ee.Image.constant(0).rename("lst").updateMask(0)
+    return _safe_image(real, dummy, coll, spec["id"])
+
+
+def _reduce_specs(image_fn, specs: list[dict], fc, scale: int, key: str = "decade_id") -> list[dict]:
+    """Mappe reduceRegions côté serveur sur l'IC des composites, retourne les props.
+
+    En cas d'échec getInfo (taille/timeout), bissection récursive des specs
+    (fallback semestriel automatique) jusqu'à 1 spec.
+    """
+    ic = ee.ImageCollection([image_fn(s) for s in specs])
+
+    def per_img(img):
+        stats = img.reduceRegions(
+            collection=fc, reducer=stats_reducer(), scale=scale, crs="EPSG:4326",
+        )
+        kv = img.get(key)
+        return stats.map(lambda f: f.set(key, kv))
+
+    fcol = ic.map(per_img).flatten()
+    try:
+        result = gee_call_with_retry(lambda: fcol.getInfo())
+        return [f["properties"] for f in result["features"]]
+    except ee.EEException:
+        if len(specs) <= 1:
+            raise
+        mid = len(specs) // 2
+        print(f"    getInfo trop volumineux ({len(specs)} décades) — bissection")
+        return (_reduce_specs(image_fn, specs[:mid], fc, scale, key)
+                + _reduce_specs(image_fn, specs[mid:], fc, scale, key))
+
+
+def extract_source(image_fn, specs_by_year: dict, fc, scale: int,
+                   rename: dict, keep: list[str], label: str) -> pd.DataFrame:
+    """Extrait une source dynamique sur toutes les années (getInfo parallélisés)."""
+    years = sorted(specs_by_year)
+
+    def one_year(year: int) -> pd.DataFrame:
+        props = _reduce_specs(image_fn, specs_by_year[year], fc, scale)
+        return parse_reduce_features(props, rename, keep)
+
+    print(f"  {label} : {len(years)} années × {GETINFO_MAX_WORKERS} workers...", flush=True)
+    with ThreadPoolExecutor(max_workers=GETINFO_MAX_WORKERS) as ex:
+        dfs = list(ex.map(one_year, years))
+    out = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=keep)
+    print(f"    {label} OK ({len(out)} lignes)")
+    return out
+
+
+# Constantes de renommage / colonnes par source (noms bruts GEE → noms métier)
+CHIRPS_RENAME = {"mean": "chirps_sum_mean", "stdDev": "chirps_sum_std",
+                 "min": "chirps_sum_min", "max": "chirps_sum_max"}
+CHIRPS_KEEP = ["region_id", "decade_id", "chirps_sum_mean", "chirps_sum_min",
+               "chirps_sum_max", "chirps_sum_std"]
+
+NDVI_RENAME = {"NDVI_mean": "ndvi_mean", "NDVI_stdDev": "ndvi_std",
+               "NDVI_min": "ndvi_min", "NDVI_max": "ndvi_max",
+               "EVI_mean": "evi_mean", "EVI_stdDev": "evi_std",
+               "EVI_min": "evi_min", "EVI_max": "evi_max"}
+NDVI_KEEP = ["region_id", "decade_id", "ndvi_mean", "ndvi_min", "ndvi_max", "ndvi_std",
+             "evi_mean", "evi_min", "evi_max", "evi_std"]
+
+LST_RENAME = {"mean": "lst_mean", "stdDev": "lst_std", "min": "lst_min", "max": "lst_max"}
+LST_KEEP = ["region_id", "decade_id", "lst_mean", "lst_min", "lst_max", "lst_std"]
+
+
+def extract_dynamic(fc, years: list[int]) -> pd.DataFrame:
+    """Assemble CHIRPS + NDVI/EVI + LST par décade × région (table longue)."""
+    calendar = build_decade_calendar(years)
+    chirps_df = extract_source(_chirps_image, build_specs(calendar, 0, 1), fc, 5566,
+                               CHIRPS_RENAME, CHIRPS_KEEP, "CHIRPS")
+    ndvi_df = extract_source(_ndvi_evi_image, build_specs(calendar, 8, 9), fc, 250,
+                             NDVI_RENAME, NDVI_KEEP, "NDVI/EVI")
+    lst_df = extract_source(_lst_image, build_specs(calendar, 4, 5), fc, 1000,
+                            LST_RENAME, LST_KEEP, "LST")
+    return calendar, [chirps_df, ndvi_df, lst_df]
+
+
+# ── 4. Humidité du sol (ERA5, mensuel) ────────────────────────────────────────
+
+def extract_soil_moisture_all(fc, years: list[int]) -> pd.DataFrame:
+    """Humidité du sol ERA5 (0–7cm) par région × (année, mois) de campagne.
+
+    Une valeur mensuelle s'applique aux 3 décades du mois ; le merge se fait sur
+    (year, month, region_id) lors de l'assemblage final.
+    """
+    rename = {"mean": "soil_moisture_mean", "stdDev": "soil_moisture_std",
+              "min": "soil_moisture_min", "max": "soil_moisture_max"}
+    keep = ["region_id", "ym", "soil_moisture_mean", "soil_moisture_min",
+            "soil_moisture_max", "soil_moisture_std"]
+    months = build_decade_calendar(years)[["year", "month"]].drop_duplicates()
+
+    def _sm_image(year: int, month: int) -> ee.Image:
+        coll = (
+            ee.ImageCollection(ERA5_MONTHLY)
+            .filter(ee.Filter.calendarRange(year, year, "year"))
+            .filter(ee.Filter.calendarRange(month, month, "month"))
+            .select("volumetric_soil_water_layer_1")
+        )
+        real = coll.first().rename("sm")
+        dummy = ee.Image.constant(0).rename("sm").updateMask(0)
+        img = ee.Image(ee.Algorithms.If(coll.size().gt(0), real, dummy))
+        return img.set("decade_id", year * 100 + month)  # ici "ym"
+
+    items = [{"year": int(r.year), "month": int(r.month)} for r in months.itertuples(index=False)]
+
+    def one_year(year: int) -> pd.DataFrame:
+        specs = [it for it in items if it["year"] == year]
+        ic = ee.ImageCollection([_sm_image(it["year"], it["month"]) for it in specs])
+
+        def per_img(img):
+            stats = img.reduceRegions(collection=fc, reducer=stats_reducer(),
+                                      scale=27750, crs="EPSG:4326")
+            kv = img.get("decade_id")
+            return stats.map(lambda f: f.set("ym", kv))
+
+        fcol = ic.map(per_img).flatten()
+        props = gee_call_with_retry(lambda: fcol.getInfo())
+        return parse_reduce_features([f["properties"] for f in props["features"]], rename, keep)
+
+    print(f"  ERA5 humidité sol : {len(years)} années...", flush=True)
+    with ThreadPoolExecutor(max_workers=GETINFO_MAX_WORKERS) as ex:
+        dfs = list(ex.map(one_year, sorted(years)))
+    out = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=keep)
+    out["year"] = (out["ym"] // 100).astype("Int64")
+    out["month"] = (out["ym"] % 100).astype("Int64")
+    return out.drop(columns=["ym"])
+
+
+# ── 5. Occupation du sol (MODIS MCD12Q1, annuel) ──────────────────────────────
+
+def extract_land_cover_all(fc, years: list[int]) -> pd.DataFrame:
+    """Mode IGBP (LC_Type1) par région × année (1 getInfo pour toutes les années)."""
+    keep = ["region_id", "year", "land_cover_mode"]
+
+    def _lc_image(year: int) -> ee.Image:
+        coll = (
+            ee.ImageCollection(MODIS_LC)
+            .filter(ee.Filter.calendarRange(year, year, "year"))
+            .select("LC_Type1")
+        )
+        real = coll.first().rename("lc")
+        dummy = ee.Image.constant(0).rename("lc").updateMask(0)
+        return ee.Image(ee.Algorithms.If(coll.size().gt(0), real, dummy)).set("year", year)
+
+    ic = ee.ImageCollection([_lc_image(y) for y in years])
+
+    def per_img(img):
+        stats = img.reduceRegions(collection=fc, reducer=ee.Reducer.mode(),
+                                  scale=500, crs="EPSG:4326")
+        return stats.map(lambda f: f.set("year", img.get("year")))
+
+    print("  Occupation du sol (MODIS) : toutes années...", flush=True)
+    fcol = ic.map(per_img).flatten()
+    props = gee_call_with_retry(lambda: fcol.getInfo())
+    return parse_reduce_features(
+        [f["properties"] for f in props["features"]],
+        {"mode": "land_cover_mode"}, keep,
+    )
+
+
+# ── 6. Baseline CHIRPS (cache one-time) ───────────────────────────────────────
 
 def compute_chirps_baseline_stats(
     fc: ee.FeatureCollection,
     baseline_years: tuple[int, int] = CHIRPS_BASELINE_YEARS,
     cache_path: Path = PATHS["baseline_cache"],
 ) -> pd.DataFrame:
-    """Calcule la moyenne décadaire historique CHIRPS (1981–2010) par région × décade-of-year.
+    """Moyenne décadaire historique CHIRPS (1981–2010) par région × décade-of-year.
 
-    Résultat : DataFrame avec colonnes region_id, month, decade_part, chirps_baseline_mean.
-    Met en cache dans un Parquet pour éviter les recalculs.
+    Résultat mis en cache (Parquet) : recalcul one-time.
     """
     if cache_path.exists():
         print(f"Baseline CHIRPS chargée depuis le cache : {cache_path}")
@@ -241,13 +378,10 @@ def compute_chirps_baseline_stats(
     print(f"Calcul baseline CHIRPS {baseline_years[0]}–{baseline_years[1]} (36 décades × 30 ans)...")
     records = []
     start_yr, end_yr = baseline_years
-    n_years = end_yr - start_yr + 1
 
     for month in range(1, 13):
         for part in (1, 2, 3):
             print(f"  Baseline mois={month:02d} partie={part}...", end=" ", flush=True)
-
-            # Empile les n_years images de somme décadaire
             images = []
             for y in range(start_yr, end_yr + 1):
                 d_start, d_end = decade_bounds(y, month, part)
@@ -264,7 +398,6 @@ def compute_chirps_baseline_stats(
 
             mean_img = ee.ImageCollection(images).mean().rename("baseline")
             props = reduce_regions(mean_img, fc, scale=5566)
-
             for p in props:
                 records.append({
                     "month": month,
@@ -281,312 +414,91 @@ def compute_chirps_baseline_stats(
     return df
 
 
-# ── 5. Extraction NDVI/EVI (MODIS MOD13A2, 16-day) ───────────────────────────
-
-def _apply_modis_ndvi_qa(image: ee.Image) -> ee.Image:
-    """Masque les pixels de faible qualité de MOD13A2 (bits 0-1 de DetailedQA > 1)."""
-    qa = image.select("DetailedQA")
-    good_mask = qa.bitwiseAnd(3).lte(1)
-    return image.updateMask(good_mask)
-
-
-def extract_ndvi_evi(fc: ee.FeatureCollection, year: int, month: int, part: int) -> pd.DataFrame:
-    """NDVI et EVI (MOD13A2) par région pour la décade, composite le plus proche. NaN si vide."""
-    empty_cols = ["region_id", "ndvi_mean", "ndvi_min", "ndvi_max", "ndvi_std",
-                  "evi_mean", "evi_min", "evi_max", "evi_std"]
-
-    d_start, d_end = decade_bounds(year, month, part)
-    window_start = (d_start - timedelta(days=8)).strftime("%Y-%m-%d")
-    window_end   = (d_end   + timedelta(days=9)).strftime("%Y-%m-%d")
-
-    coll = (
-        ee.ImageCollection(MODIS_NDVI_EVI)
-        .filterDate(window_start, window_end)
-        .map(_apply_modis_ndvi_qa)
-        .select(["NDVI", "EVI"])
-    )
-    if _collection_empty(coll):
-        return pd.DataFrame(columns=empty_cols)
-
-    # Composite le plus récent avant la fin de la décade
-    img = coll.sort("system:time_start", False).first().multiply(0.0001)
-
-    props = reduce_regions(img, fc, scale=250)
-    df = _props_to_df(props)
-
-    rename = {
-        "NDVI_mean": "ndvi_mean", "NDVI_stdDev": "ndvi_std",
-        "NDVI_min":  "ndvi_min",  "NDVI_max":    "ndvi_max",
-        "EVI_mean":  "evi_mean",  "EVI_stdDev":  "evi_std",
-        "EVI_min":   "evi_min",   "EVI_max":     "evi_max",
-    }
-    df = df.rename(columns=rename)
-    cols = [c for c in empty_cols if c in df.columns]
-    return df[cols]
-
-
-# ── 6. Extraction LST (MODIS MOD11A2, 8-day) ──────────────────────────────────
-
-def _apply_modis_lst_qa(image: ee.Image) -> ee.Image:
-    """Masque les pixels de faible qualité de MOD11A2 (bits 0-1 de QC_Day != 0)."""
-    qa = image.select("QC_Day")
-    good_mask = qa.bitwiseAnd(3).eq(0)
-    return image.updateMask(good_mask)
-
-
-def extract_lst(fc: ee.FeatureCollection, year: int, month: int, part: int) -> pd.DataFrame:
-    """LST diurne (MOD11A2) en Kelvin par région. NaN si pas de données."""
-    empty_cols = ["region_id", "lst_mean", "lst_min", "lst_max", "lst_std"]
-
-    d_start, d_end = decade_bounds(year, month, part)
-    window_start = (d_start - timedelta(days=4)).strftime("%Y-%m-%d")
-    window_end   = (d_end   + timedelta(days=5)).strftime("%Y-%m-%d")
-
-    coll = (
-        ee.ImageCollection(MODIS_LST)
-        .filterDate(window_start, window_end)
-        .map(_apply_modis_lst_qa)
-        .select("LST_Day_1km")
-    )
-    if _collection_empty(coll):
-        return pd.DataFrame(columns=empty_cols)
-
-    img = coll.sort("system:time_start", False).first().multiply(0.02).rename("lst")
-
-    props = reduce_regions(img, fc, scale=1000)
-    df = _props_to_df(props)
-
-    # GEE retourne mean/stdDev/min/max sans préfixe pour les images mono-bande
-    rename = {
-        "mean": "lst_mean", "stdDev": "lst_std",
-        "min":  "lst_min",  "max":    "lst_max",
-    }
-    df = df.rename(columns=rename)
-    cols = [c for c in empty_cols if c in df.columns]
-    return df[cols]
-
-
-# ── 7. Extraction humidité du sol (ERA5, mensuel) ─────────────────────────────
-
-def extract_soil_moisture(fc: ee.FeatureCollection, year: int, month: int) -> pd.DataFrame:
-    """Humidité du sol ERA5 (couche 0–7cm) par région pour le mois donné."""
-    empty_cols = ["region_id", "soil_moisture_mean", "soil_moisture_min",
-                  "soil_moisture_max", "soil_moisture_std"]
-
-    coll = (
-        ee.ImageCollection(ERA5_MONTHLY)
-        .filter(ee.Filter.calendarRange(year, year, "year"))
-        .filter(ee.Filter.calendarRange(month, month, "month"))
-        .select("volumetric_soil_water_layer_1")
-    )
-    if _collection_empty(coll):
-        return pd.DataFrame(columns=empty_cols)
-
-    img = coll.first().rename("sm")
-
-    props = reduce_regions(img, fc, scale=27750)
-    df = _props_to_df(props)
-
-    # GEE retourne mean/stdDev/min/max sans préfixe pour les images mono-bande
-    rename = {
-        "mean": "soil_moisture_mean", "stdDev": "soil_moisture_std",
-        "min":  "soil_moisture_min",  "max":    "soil_moisture_max",
-    }
-    df = df.rename(columns=rename)
-    cols = [c for c in empty_cols if c in df.columns]
-    return df[cols]
-
-
-# ── 8. Occupation du sol (MODIS MCD12Q1, annuel) ──────────────────────────────
-
-def extract_land_cover(fc: ee.FeatureCollection, year: int) -> pd.DataFrame:
-    """Mode de la classification IGBP (LC_Type1) par région pour l'année donnée."""
-    coll = (
-        ee.ImageCollection(MODIS_LC)
-        .filter(ee.Filter.calendarRange(year, year, "year"))
-        .select("LC_Type1")
-    )
-    if _collection_empty(coll):
-        return pd.DataFrame(columns=["region_id", "land_cover_mode"])
-
-    img = coll.first().rename("lc")
-    props = reduce_regions_mode(img, fc, scale=500)
-    df = _props_to_df(props).rename(columns={"mode": "land_cover_mode"})
-    return df[["region_id", "land_cover_mode"]]
-
-
-# ── 9. Sources statiques ───────────────────────────────────────────────────────
+# ── 7. Sources statiques ───────────────────────────────────────────────────────
 
 def extract_dem(fc: ee.FeatureCollection) -> pd.DataFrame:
     """Altitude SRTM (moyenne, min, max) par région. Calculé une seule fois."""
     img = ee.Image(DEM_ASSET).select("elevation").rename("dem")
-    props = reduce_regions(img, fc, scale=30)
-    df = _props_to_df(props)
-    # GEE retourne mean/stdDev/min/max sans préfixe pour les images mono-bande
-    rename = {
-        "mean": "dem_mean", "min": "dem_min", "max": "dem_max",
-    }
-    df = df.rename(columns=rename)
+    df = _props_to_df(reduce_regions(img, fc, scale=30))
+    df = df.rename(columns={"mean": "dem_mean", "min": "dem_min", "max": "dem_max"})
     keep = [c for c in ["region_id", "dem_mean", "dem_min", "dem_max"] if c in df.columns]
     return df[keep]
 
 
 def extract_soil_texture(fc: ee.FeatureCollection) -> pd.DataFrame:
-    """Texture du sol OpenLandMap (sable, argile, limon en %) par région. Calculé une seule fois.
+    """Texture du sol OpenLandMap (sable, argile, limon en %) par région.
 
-    Les valeurs natives sont en g/kg (0–1000) ; on divise par 10 pour obtenir des %.
+    Les bandes b0 de SAND/CLAY-WFRACTION sont déjà en pourcentage (0–100).
+    OpenLandMap ne publie pas de fraction limon : silt = 100 − sable − argile.
     """
-    sand = ee.Image(OLM_SAND).select("b0").divide(10).rename("sand")
-    clay = ee.Image(OLM_CLAY).select("b0").divide(10).rename("clay")
-    silt = ee.Image(OLM_SILT).select("b0").divide(10).rename("silt")
+    sand = ee.Image(OLM_SAND).select("b0").rename("sand")
+    clay = ee.Image(OLM_CLAY).select("b0").rename("clay")
+    silt = ee.Image.constant(100).subtract(sand).subtract(clay).rename("silt")
     img = ee.Image.cat([sand, clay, silt])
 
-    props = reduce_regions(img, fc, scale=250)
-    df = _props_to_df(props)
-    rename = {
-        "sand_mean": "soil_sand_mean",
-        "clay_mean": "soil_clay_mean",
-        "silt_mean": "soil_silt_mean",
-    }
-    df = df.rename(columns=rename)
+    df = _props_to_df(reduce_regions(img, fc, scale=250))
+    df = df.rename(columns={"sand_mean": "soil_sand_mean", "clay_mean": "soil_clay_mean",
+                            "silt_mean": "soil_silt_mean"})
     keep = [c for c in ["region_id", "soil_sand_mean", "soil_clay_mean", "soil_silt_mean"]
             if c in df.columns]
     return df[keep]
 
 
-# ── 10. ENSO/ONI (source externe NOAA) ────────────────────────────────────────
+# ── 8. ENSO/ONI (source externe NOAA) ─────────────────────────────────────────
+
+# L'ONI NOAA est une moyenne glissante trimestrielle ; chaque saison se rattache
+# à son mois central (DJF→janvier, JFM→février, …, NDJ→décembre).
+_ONI_SEASON_MONTH = {
+    "DJF": 1, "JFM": 2, "FMA": 3, "MAM": 4, "AMJ": 5, "MJJ": 6,
+    "JJA": 7, "JAS": 8, "ASO": 9, "SON": 10, "OND": 11, "NDJ": 12,
+}
+
 
 def fetch_enso_oni() -> pd.DataFrame:
-    """Télécharge et parse l'indice ONI depuis NOAA CPC.
+    """Télécharge et parse l'indice ONI depuis NOAA CPC (year, month, enso_oni).
 
-    Retourne un DataFrame avec colonnes year, month, enso_oni.
+    Format source : colonnes `SEAS YR TOTAL ANOM` (la saison trimestrielle est
+    convertie en mois central, l'anomalie ANOM sert d'indice ONI).
     """
-    print(f"Téléchargement ENSO/ONI depuis NOAA...")
+    print("Téléchargement ENSO/ONI depuis NOAA...")
     resp = requests.get(ENSO_URL, timeout=30)
     resp.raise_for_status()
 
-    lines = [l for l in resp.text.splitlines() if l.strip() and not l.strip().startswith("YR")]
     rows = []
-    for line in lines:
+    for line in resp.text.splitlines():
         parts = line.split()
-        if len(parts) >= 5:
-            try:
-                rows.append({
-                    "year": int(parts[0]),
-                    "month": int(parts[1]),
-                    "enso_oni": float(parts[4]),
-                })
-            except (ValueError, IndexError):
-                continue
+        if len(parts) < 4:
+            continue
+        month = _ONI_SEASON_MONTH.get(parts[0])
+        if month is None:  # en-tête ou ligne non reconnue
+            continue
+        try:
+            rows.append({"year": int(parts[1]), "month": month,
+                         "enso_oni": float(parts[3])})
+        except (ValueError, IndexError):
+            continue
 
     df = pd.DataFrame(rows)
     print(f"  {len(df)} entrées ONI chargées ({df['year'].min()}–{df['year'].max()})")
     return df
 
 
-# ── 11. Boucle principale d'extraction ────────────────────────────────────────
+# ── 9. Assemblage final ───────────────────────────────────────────────────────
 
-def extract_all_decades(
-    fc: ee.FeatureCollection,
-    gdf: gpd.GeoDataFrame,
-    baseline_df: pd.DataFrame,
-    years: list[int],
-) -> pd.DataFrame:
-    """Boucle année → mois → décade et accumule toutes les extractions dynamiques."""
-
-    decade_cal = build_decade_calendar(years)
-    all_rows = []
-
-    # Cache ERA5 mensuel (évite 3 appels/mois identiques pour D1, D2, D3)
-    sm_cache: dict[tuple, pd.DataFrame] = {}
-    # Cache land cover annuel
-    lc_cache: dict[int, pd.DataFrame] = {}
-
-    total = len(decade_cal)
-    print(f"\nExtraction : {total} décades × 90 régions (années {years[0]}–{years[-1]})")
-
-    for i, row in decade_cal.iterrows():
-        year, month, part = int(row["year"]), int(row["month"]), int(row["decade_part"])
-        print(f"  [{i+1}/{total}] {row['campaign']} décade {row['decade_num']:02d} "
-              f"({row['date_start'].date()} → {row['date_end'].date()})", end=" ", flush=True)
-
-        # ── CHIRPS somme ──────────────────────────────────────────────────
-        chirps_df = extract_chirps_sum(fc, year, month, part)
-
-        # ── CHIRPS anomalie (soustraction pandas) ─────────────────────────
-        base_key = baseline_df[
-            (baseline_df["month"] == month) & (baseline_df["decade_part"] == part)
-        ][["region_id", "chirps_baseline_mean"]]
-
-        if chirps_df.empty or base_key.empty:
-            chirps_df["chirps_anomaly_mean"] = np.nan
-        else:
-            chirps_df = chirps_df.merge(base_key, on="region_id", how="left")
-            chirps_df["chirps_anomaly_mean"] = (
-                chirps_df["chirps_sum_mean"] - chirps_df["chirps_baseline_mean"]
-            )
-            chirps_df = chirps_df.drop(columns=["chirps_baseline_mean"])
-
-        # ── NDVI / EVI ────────────────────────────────────────────────────
-        ndvi_df = extract_ndvi_evi(fc, year, month, part)
-
-        # ── LST ───────────────────────────────────────────────────────────
-        lst_df = extract_lst(fc, year, month, part)
-
-        # ── Humidité sol (cache mensuel) ──────────────────────────────────
-        if (year, month) not in sm_cache:
-            sm_cache[(year, month)] = extract_soil_moisture(fc, year, month)
-        sm_df = sm_cache[(year, month)]
-
-        # ── Occupation du sol (cache annuel) ─────────────────────────────
-        if year not in lc_cache:
-            lc_cache[year] = extract_land_cover(fc, year)
-        lc_df = lc_cache[year]
-
-        # ── Assemblage de la décade ───────────────────────────────────────
-        # Base : toutes les régions avec les métadonnées temporelles
-        base = pd.DataFrame({
-            "region_id":   gdf["rn_num"].astype(int).tolist(),
-            "region_nom":  gdf["rn_nom"].tolist(),
-            "campaign":    row["campaign"],
-            "decade_num":  row["decade_num"],
-            "date_start":  row["date_start"],
-            "date_end":    row["date_end"],
-            "year":        year,
-            "month":       month,
-            "decade_part": part,
-        })
-
-        for dyn_df in [chirps_df, ndvi_df, lst_df, sm_df, lc_df]:
-            if not dyn_df.empty and "region_id" in dyn_df.columns:
-                base = base.merge(dyn_df, on="region_id", how="left")
-
-        all_rows.append(base)
-        print("OK")
-
-    return pd.concat(all_rows, ignore_index=True)
-
-
-# ── 12. Assemblage final ───────────────────────────────────────────────────────
-
-def merge_all(
-    decades_df: pd.DataFrame,
-    dem_df: pd.DataFrame,
-    soil_df: pd.DataFrame,
-    enso_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Joint les features statiques et l'ONI à la table principale."""
-    df = decades_df.copy()
+def merge_static(df: pd.DataFrame, dem_df: pd.DataFrame, soil_df: pd.DataFrame,
+                 enso_df: pd.DataFrame) -> pd.DataFrame:
+    """Joint les features statiques (DEM, texture) et l'ONI à la table principale."""
+    out = df.copy()
     if not dem_df.empty:
-        df = df.merge(dem_df, on="region_id", how="left")
+        out = out.merge(dem_df, on="region_id", how="left")
     if not soil_df.empty:
-        df = df.merge(soil_df, on="region_id", how="left")
+        out = out.merge(soil_df, on="region_id", how="left")
     if not enso_df.empty:
-        df = df.merge(enso_df, on=["year", "month"], how="left")
-    return df
+        out = out.merge(enso_df, on=["year", "month"], how="left")
+    return out
 
 
-# ── 13. Validation de la sortie ───────────────────────────────────────────────
+# ── 10. Validation de la sortie ───────────────────────────────────────────────
 
 def validate_output(df: pd.DataFrame) -> None:
     """Vérifie les plages physiques attendues. Lève AssertionError si invalide."""
@@ -608,88 +520,88 @@ def validate_output(df: pd.DataFrame) -> None:
         assert (valid >= 0).all(), f"CHIRPS négatif : {valid.min()}"
 
     if "soil_sand_mean" in df.columns and "soil_clay_mean" in df.columns:
-        total = (df["soil_sand_mean"].fillna(0)
-                 + df["soil_clay_mean"].fillna(0)
+        total = (df["soil_sand_mean"].fillna(0) + df["soil_clay_mean"].fillna(0)
                  + df["soil_silt_mean"].fillna(0))
-        # La somme peut dépasser 100% selon l'arrondi OpenLandMap — seuil large
         assert total.max() <= 120, f"Texture sol : somme > 120% ({total.max():.1f})"
 
     print(f"Validation OK — {len(df)} lignes, {len(df.columns)} colonnes")
-    print(f"  NaN NDVI : {df['ndvi_mean'].isna().mean():.1%}" if "ndvi_mean" in df.columns else "")
-    print(f"  NaN LST  : {df['lst_mean'].isna().mean():.1%}" if "lst_mean" in df.columns else "")
+    if "ndvi_mean" in df.columns:
+        print(f"  NaN NDVI : {df['ndvi_mean'].isna().mean():.1%}")
+    if "lst_mean" in df.columns:
+        print(f"  NaN LST  : {df['lst_mean'].isna().mean():.1%}")
 
 
-# ── 14. Test d'intégration ────────────────────────────────────────────────────
+# ── 11. Test d'intégration ────────────────────────────────────────────────────
 
 def run_integration_test(fc: ee.FeatureCollection, gdf: gpd.GeoDataFrame) -> None:
-    """Teste chaque extracteur sur une seule région (rn_num=1) et une seule décade.
-
-    Lève AssertionError en cas d'échec.
-    """
+    """Teste chaque extracteur sur une seule région (rn_num=1) et une décade."""
     print("\n=== Test d'intégration : région 1, janvier 2010 D1 ===")
+    region_id = int(gdf["rn_num"].iloc[0])
+    fc_test = fc.filter(ee.Filter.eq("region_id", region_id))
 
-    # FeatureCollection réduite à la première région
-    first = gdf.iloc[[0]]
-    _, fc_one = load_regions(PATHS["regions_shp"])
-    region_id = int(first["rn_num"].iloc[0])
-    fc_test = fc_one.filter(ee.Filter.eq("region_id", region_id))
+    calendar = build_decade_calendar([2010])
+    one = calendar[(calendar["month"] == 1) & (calendar["decade_part"] == 1)]
+    did = int(one["decade_id"].iloc[0])
 
-    year, month, part = 2010, 1, 1
+    def _one_spec(lead, lag):
+        spec = next(s for s in build_specs(calendar, lead, lag)[2010] if s["id"] == did)
+        return {2010: [spec]}
 
-    # CHIRPS
-    df = extract_chirps_sum(fc_test, year, month, part)
-    assert df.empty or (df["chirps_sum_mean"].dropna() >= 0).all(), "CHIRPS : valeurs négatives"
+    df = extract_source(_chirps_image, _one_spec(0, 1), fc_test, 5566,
+                        CHIRPS_RENAME, CHIRPS_KEEP, "CHIRPS")
+    assert df.empty or (df["chirps_sum_mean"].dropna() >= 0).all(), "CHIRPS : négatif"
     print("  CHIRPS somme : OK")
 
-    # NDVI/EVI
-    df = extract_ndvi_evi(fc_test, year, month, part)
+    df = extract_source(_ndvi_evi_image, _one_spec(8, 9), fc_test, 250,
+                        NDVI_RENAME, NDVI_KEEP, "NDVI/EVI")
     if not df.empty and "ndvi_mean" in df.columns:
-        valid = df["ndvi_mean"].dropna()
-        assert valid.between(-1, 1).all(), f"NDVI hors plage : {valid.values}"
+        assert df["ndvi_mean"].dropna().between(-1, 1).all(), "NDVI hors plage"
     print("  NDVI/EVI     : OK")
 
-    # LST
-    df = extract_lst(fc_test, year, month, part)
+    df = extract_source(_lst_image, _one_spec(4, 5), fc_test, 1000,
+                        LST_RENAME, LST_KEEP, "LST")
     if not df.empty and "lst_mean" in df.columns:
-        valid = df["lst_mean"].dropna()
-        assert valid.between(200, 400).all(), f"LST hors plage Kelvin : {valid.values}"
+        assert df["lst_mean"].dropna().between(200, 400).all(), "LST hors plage Kelvin"
     print("  LST          : OK")
 
-    # ERA5
-    df = extract_soil_moisture(fc_test, year, month)
+    df = extract_soil_moisture_all(fc_test, [2010])
     if not df.empty and "soil_moisture_mean" in df.columns:
-        valid = df["soil_moisture_mean"].dropna()
-        assert valid.between(0, 1).all(), f"Humidité sol hors [0,1] : {valid.values}"
+        assert df["soil_moisture_mean"].dropna().between(0, 1).all(), "Humidité hors [0,1]"
     print("  ERA5 sol     : OK")
 
-    # DEM
     df = extract_dem(fc_test)
     if not df.empty and "dem_mean" in df.columns:
         assert (df["dem_mean"].dropna() >= 0).all(), "DEM : altitude négative"
     print("  DEM SRTM     : OK")
 
-    # Texture sol
     df = extract_soil_texture(fc_test)
     if not df.empty and "soil_sand_mean" in df.columns:
-        total = df["soil_sand_mean"].fillna(0) + df["soil_clay_mean"].fillna(0) + df["soil_silt_mean"].fillna(0)
+        total = (df["soil_sand_mean"].fillna(0) + df["soil_clay_mean"].fillna(0)
+                 + df["soil_silt_mean"].fillna(0))
         assert total.max() <= 120, f"Texture sol : somme > 120% ({total.max():.1f})"
     print("  Texture sol  : OK")
 
-    # ENSO
     enso = fetch_enso_oni()
-    assert not enso.empty, "ENSO : DataFrame vide"
-    assert "enso_oni" in enso.columns
+    assert not enso.empty and "enso_oni" in enso.columns, "ENSO : DataFrame vide"
     print("  ENSO/ONI     : OK")
 
     print("=== Test d'intégration réussi ===\n")
 
 
-# ── 15. Point d'entrée ────────────────────────────────────────────────────────
+# ── 12. Point d'entrée ────────────────────────────────────────────────────────
+
+def init_gee() -> None:
+    """Initialise GEE ; n'ouvre le flow d'authentification que si nécessaire."""
+    try:
+        ee.Initialize(project=GEE_PROJECT_ID)
+    except Exception:
+        ee.Authenticate()
+        ee.Initialize(project=GEE_PROJECT_ID)
+
 
 def run(years: list[int] = YEARS, test_only: bool = False) -> None:
-    print(f"Authentification GEE (projet : {GEE_PROJECT_ID})...")
-    ee.Authenticate()
-    ee.Initialize(project=GEE_PROJECT_ID)
+    print(f"Initialisation GEE (projet : {GEE_PROJECT_ID})...")
+    init_gee()
     print("GEE initialisé.")
 
     print(f"Chargement des régions naturelles : {PATHS['regions_shp']}")
@@ -700,30 +612,37 @@ def run(years: list[int] = YEARS, test_only: bool = False) -> None:
         run_integration_test(fc, gdf)
         return
 
-    # Baseline CHIRPS (mise en cache automatique)
+    # Baseline CHIRPS (cache automatique)
     baseline_df = compute_chirps_baseline_stats(fc)
 
-    # Extraction dynamique
-    decades_df = extract_all_decades(fc, gdf, baseline_df, years)
+    # Extraction dynamique batch (côté serveur)
+    print(f"\nExtraction dynamique (années {years[0]}–{years[-1]})")
+    calendar, source_dfs = extract_dynamic(fc, years)
 
-    # Sources statiques
+    # Assemblage décadaire + anomalie CHIRPS
+    decades_df = assemble_decades(calendar, regions_table(gdf), source_dfs)
+    decades_df = compute_chirps_anomaly(decades_df, baseline_df)
+
+    # Sources mensuelles / annuelles
+    sm_df = extract_soil_moisture_all(fc, years)
+    lc_df = extract_land_cover_all(fc, years)
+    decades_df = decades_df.merge(sm_df, on=["year", "month", "region_id"], how="left")
+    decades_df = decades_df.merge(lc_df, on=["year", "region_id"], how="left")
+
+    # Sources statiques + ENSO
     print("\nExtraction DEM SRTM...")
     dem_df = extract_dem(fc)
-
     print("Extraction texture du sol OpenLandMap...")
     soil_df = extract_soil_texture(fc)
-
-    # ENSO
     enso_df = fetch_enso_oni()
 
-    # Assemblage
     print("\nAssemblage final...")
-    full_df = merge_all(decades_df, dem_df, soil_df, enso_df)
+    full_df = merge_static(decades_df, dem_df, soil_df, enso_df)
 
-    # Validation
+    # Garde-fous + validation
+    assert_decade_completeness(full_df, n_regions=len(gdf))
     validate_output(full_df)
 
-    # Sauvegarde
     out = PATHS["output_parquet"]
     out.parent.mkdir(parents=True, exist_ok=True)
     full_df.to_parquet(out, index=False)
