@@ -1,5 +1,5 @@
 ---
-Status: in-progress
+Status: done
 ---
 
 # #11 — NeuralProphet multi-horizon (décadaire / mensuel / saisonnier)

@@ -23,6 +23,12 @@ import time
 import warnings
 from pathlib import Path
 
+# UTF-8 forcé sur Windows pour éviter UnicodeEncodeError de tqdm (CP1252)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -37,8 +43,11 @@ OUT_DECISION   = DATA_DIR / "processed" / "11_decision_deploiement.csv"
 sys.path.insert(0, str(Path(__file__).parent))
 from lgbm_baseline_07 import evaluate, optimize_threshold, walk_forward_folds
 
-N_FORECASTS = 10   # nombre de décades prédites simultanément
-N_LAGS      = 30   # lags AR = 1 campagne complète
+N_FORECASTS = 10   # cible : NP force n_forecasts=1 si n_lags=0 (voir forecaster.py:1052-1054)
+N_LAGS      = 0    # pas de lags AR : modèle tendance+saisonnalité pur, robuste aux séries éparses
+# NB : avec n_lags=0, NP override n_forecasts→1 (sans AR, toute date future est prédictible
+#      indépendamment). Conséquence : yhat3/yhat10 absents → fallback yhat1.shift(1) pour
+#      tous les horizons (pred_k[v] = model(v) = tendance(v)+saisonnalité(v) pour tout k).
 EPOCHS      = 100
 
 # horizons évalués : name → step index (1-indexed, correspond à yhat{k})
@@ -79,21 +88,65 @@ def decode_decade_to_date(campagne_calc: str, campagne_decade: int) -> pd.Timest
 # Préparation panel NeuralProphet
 # ---------------------------------------------------------------------------
 
-def prepare_panel_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Construit un DataFrame panel au format NeuralProphet : ds, y, ID.
+_REF_DATE = pd.Timestamp("2001-10-01")
+_REF_YEAR = 2001
+
+
+def _decade_ordinal_date(campagne_calc: str, campagne_decade: int) -> pd.Timestamp:
+    """Date synthétique régulière (pas de lacune estivale) pour NeuralProphet.
+
+    Chaque décade reçoit une date fictive espacée de 10 jours à partir du
+    01/10/2001, sans saut d'août-septembre entre campagnes. Cela évite que
+    NeuralProphet n'insère des lignes manquantes pour les mois d'été.
+    """
+    start_year = int(campagne_calc.split("-")[0])
+    ordinal    = (start_year - _REF_YEAR) * 30 + (campagne_decade - 1)
+    return _REF_DATE + pd.Timedelta(days=10) * ordinal
+
+
+def prepare_panel_df(
+    df: pd.DataFrame,
+    all_rn_nums: list[int] | None = None,
+) -> pd.DataFrame:
+    """Construit un panel COMPLET pour NeuralProphet : ds, y, ID.
+
+    Le parquet #06 est sparse (toutes les combinaisons rn_num × campagne ×
+    décade ne sont pas présentes). Pour éviter que NeuralProphet n'insère des
+    lignes fictives, on construit la grille exhaustive et on remplit les cellules
+    manquantes avec y=NaN.
 
     - ID  = rn_num (str)
-    - ds  = date absolue de la décade
-    - y   = label (0/1) ou NaN pour les lignes d'inférence
+    - ds  = date ordinale régulière (10 jours, sans lacune estivale)
+    - y   = label (0/1) ou NaN pour les cellules absentes / inférence
     """
+    if all_rn_nums is None:
+        all_rn_nums = sorted(df["rn_num"].dropna().astype(int).unique())
+
+    camps   = sorted(df["campagne_calc"].unique(), key=lambda c: int(c.split("-")[0]))
+    decades = list(range(1, 31))
+
+    # Grille complète : toutes les combinaisons (rn_num, campagne, décade)
+    grid = pd.DataFrame(
+        [(rn, camp, dec) for rn in all_rn_nums for camp in camps for dec in decades],
+        columns=["rn_num", "campagne_calc", "campagne_decade"],
+    )
+    grid["rn_num"] = grid["rn_num"].astype("Int64")
+
+    data = df[["rn_num", "campagne_calc", "campagne_decade", "label"]].copy()
+    data["rn_num"] = data["rn_num"].astype("Int64")
+
+    merged = grid.merge(
+        data, on=["rn_num", "campagne_calc", "campagne_decade"], how="left"
+    )
+
     ds_col = [
-        decode_decade_to_date(c, d)
-        for c, d in zip(df["campagne_calc"], df["campagne_decade"])
+        _decade_ordinal_date(c, d)
+        for c, d in zip(merged["campagne_calc"], merged["campagne_decade"])
     ]
     panel = pd.DataFrame({
-        "ID": df["rn_num"].astype(str).values,
+        "ID": merged["rn_num"].astype(str).values,
         "ds": ds_col,
-        "y":  pd.to_numeric(df["label"], errors="coerce").values,
+        "y":  pd.to_numeric(merged["label"], errors="coerce").astype("float64").values,
     })
     return panel.sort_values(["ID", "ds"]).reset_index(drop=True)
 
@@ -103,15 +156,18 @@ def prepare_panel_df(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def train_neuralprophet(df_panel: pd.DataFrame):
-    """Entraîne un NeuralProphet sur le panel (90 séries × N décades)."""
+    """Entraîne un NeuralProphet sur le panel complet (90 séries × N décades)."""
     from neuralprophet import NeuralProphet  # import local pour les tests sans NP
 
     model = NeuralProphet(
         n_forecasts=N_FORECASTS,
         n_lags=N_LAGS,
         epochs=EPOCHS,
+        learning_rate=0.001,            # fixe le LR (lr_finder incompatible PyTorch 2.6)
         accelerator="cpu",
-        progress=None,
+        normalize="off",                # labels 0/1 — pas de normalisation nécessaire
+        drop_missing=True,              # ignore les samples y=NaN (cellules non prospectées)
+        unknown_data_normalization=True,# régions sans labels en train → params globaux
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -146,22 +202,44 @@ def rolling_forecast(
         .reset_index(drop=True)
     )
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        forecast = model.predict(df_combined)
-
-    val_ds_set = set(df_val_panel["ds"].unique())
-
+    # Workaround bug NeuralProphet 0.8 : predict() sur le panel complet supprime
+    # 1 ligne en interne (window NaN dans les inputs) mais garde df_forecast de
+    # taille originale → ValueError. On prédit région par région pour que chaque
+    # série soit indépendante.  Avec n_lags=0, y n'est pas une entrée du modèle
+    # → remplir les NaN par 0 n'affecte pas les prédictions yhat*.
+    val_ds_set  = set(df_val_panel["ds"].unique())
+    true_y_idx  = df_combined.set_index(["ID", "ds"])["y"]
     result_parts: list[pd.DataFrame] = []
-    for region_id, grp in forecast.groupby("ID"):
+
+    for region_id, grp in df_combined.groupby("ID"):
         grp = grp.sort_values("ds").reset_index(drop=True)
-        out = grp[["ID", "ds", "y"]].copy()
+        grp_pred = grp.copy()
+        grp_pred["y"] = grp_pred["y"].fillna(0.0)
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                forecast = model.predict(grp_pred)
+        except Exception:
+            continue
+
+        out = forecast[["ID", "ds"]].copy()
+        # Restaurer les vraies étiquettes (NaN pour décades non observées)
+        out["y"] = out.set_index(["ID", "ds"]).index.map(true_y_idx).values
         for k in HORIZONS.values():
             col = f"yhat{k}"
-            if col in grp.columns:
-                # pred_k[v] = yhat{k}[v-k] : prédiction pour v faite k pas avant
-                out[f"pred_{k}"] = grp[col].shift(k)
+            if col in forecast.columns:
+                # Vrai multi-horizon (n_lags > 0) : pred_k[v] = yhat{k}[v-k]
+                out[f"pred_{k}"] = forecast[col].shift(k)
+            elif "yhat1" in forecast.columns:
+                # NeuralProphet force n_forecasts=1 quand n_lags=0 : sans AR,
+                # la prédiction horizon k pour la date v est model(v) = yhat1[v-1]
+                # pour tout k (tendance+saisonnalité évaluée à v, indépendante du lag).
+                out[f"pred_{k}"] = forecast["yhat1"].shift(1)
         result_parts.append(out)
+
+    if not result_parts:
+        return pd.DataFrame()
 
     all_preds = pd.concat(result_parts, ignore_index=True)
     return all_preds[all_preds["ds"].isin(val_ds_set)].copy()
@@ -206,6 +284,9 @@ def walk_forward_neuralprophet(df: pd.DataFrame) -> pd.DataFrame:
     labeled["label"] = labeled["label"].astype(int)
     folds = walk_forward_folds(labeled)
 
+    # Liste complète des 90 régions naturelles (fixe pour tous les folds)
+    all_rn_nums = sorted(df["rn_num"].dropna().astype(int).unique())
+
     rapport_rows: list[dict] = []
     pooled: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {
         k: [] for k in HORIZONS.values()
@@ -218,8 +299,8 @@ def walk_forward_neuralprophet(df: pd.DataFrame) -> pd.DataFrame:
         train_mask = (
             df["campagne_calc"].str.split("-").str[0].astype(int) < val_start
         )
-        panel_train = prepare_panel_df(df[train_mask])
-        panel_val   = prepare_panel_df(df_val_labeled)
+        panel_train = prepare_panel_df(df[train_mask], all_rn_nums=all_rn_nums)
+        panel_val   = prepare_panel_df(df_val_labeled, all_rn_nums=all_rn_nums)
 
         n_pos = int((df_val_labeled["label"] == 1).sum())
         n_neg = int((df_val_labeled["label"] == 0).sum())
@@ -339,7 +420,8 @@ def run() -> None:
 
     # Modèle final entraîné sur toutes les données (train + val + inference pour les lags)
     print("\nEntraînement modèle final sur toutes les données…")
-    panel_all = prepare_panel_df(df)
+    all_rn_nums = sorted(df["rn_num"].dropna().astype(int).unique())
+    panel_all   = prepare_panel_df(df, all_rn_nums=all_rn_nums)
     model_final = train_neuralprophet(panel_all)
 
     total_min = (time.time() - t0) / 60

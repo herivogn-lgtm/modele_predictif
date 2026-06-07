@@ -108,7 +108,8 @@ def test_prepare_panel_df_nan_pour_inference():
     df_full = pd.concat([df, inf_row], ignore_index=True)
 
     panel = pipeline.prepare_panel_df(df_full)
-    target_ds = pipeline.decode_decade_to_date("2023-2024", 1)
+    # Le panel utilise des dates ordinales (_decade_ordinal_date), pas les dates calendaires
+    target_ds = pipeline._decade_ordinal_date("2023-2024", 1)
     inf_panel = panel[panel["ds"] == target_ds]
     assert inf_panel["y"].isna().all(), "Les lignes inference doivent avoir y=NaN"
 
