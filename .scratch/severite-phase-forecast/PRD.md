@@ -11,7 +11,7 @@ Status: ready-for-agent
 
 L'IFVM lutte contre le Criquet migrateur malgache (*Locusta migratoria capito*) de
 manière essentiellement **réactive** : on prospecte puis on traite une fois les foyers
-visibles. La surveillance préventive est coûteuse et discontinue, et les zones à risque
+visibles. La surveillance acridienne dévient coûteuse et discontinue, et les zones à risque
 ne sont pas anticipées. Le décideur n'a aucun outil lui disant **où** et **avec quelle
 gravité** un foyer risque d'apparaître à la **prochaine décade**, ce qui empêche de
 cibler les prospections et de réduire les coûts.
@@ -32,7 +32,7 @@ L'outil oriente les prospections vers les cellules à sévérité 2–3.
 1. En tant que prospecteur IFVM, je veux une carte de sévérité-phase 0–3 à 1 km pour la décade à venir, afin de concentrer mes tournées sur les cellules les plus à risque.
 2. En tant que prospecteur IFVM, je veux distinguer une présence solitaire (niveau 1, bruit de fond) d'un foyer transiens/grégaire (niveaux 2–3), afin de ne pas gaspiller mes déplacements sur des présences sans enjeu.
 3. En tant que responsable de la lutte, je veux une alerte dès qu'une cellule passe au niveau 3 (grégaire) en T+1, afin de déclencher une intervention avant l'expression du foyer.
-4. En tant que responsable de la lutte, je veux une vue agrégée mensuelle de la sévérité par aire complémentaire (AMI/ATM/AD/AGT), afin de planifier les campagnes.
+4. En tant que responsable de la lutte, je veux une vue agrégée mensuelle de la sévérité par aire complémentaire (AMI/ATM/AD/AGT), afin de planifier les interventions.
 5. En tant que décideur national, je veux une carte de probabilité de présence (binaire dérivé), afin de comparer la performance à la littérature (AUC) et de justifier l'outil.
 6. En tant que prospecteur, je veux que la prédiction couvre toute l'aire grégarigène (les 12 secteurs), pas seulement le Sud-Ouest, afin de ne pas laisser d'angle mort.
 7. En tant qu'analyste, je veux que les cellules non prospectées soient prédites (surface de prédiction) et non traitées comme des absences, afin d'éviter un biais massif.
