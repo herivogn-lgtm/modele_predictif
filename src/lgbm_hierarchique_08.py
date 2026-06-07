@@ -42,7 +42,7 @@ OUT_MODEL_DENSITE  = DATA_DIR / "processed" / "08_lgbm_densite.pkl"
 OUT_MODEL_PHASE    = DATA_DIR / "processed" / "08_lgbm_phase.pkl"
 
 KEY_COLS  = ["rn_num", "rn_nom", "campagne_calc", "campagne_decade"]
-META_COLS = ["split", "effort_prospection", "label"]
+META_COLS = ["split", "effort_prospection", "label", "date_start"]
 
 DENSITY_COL      = "densite_imago_median"
 PHASE_COL        = "niveau_gregarite_dominant"

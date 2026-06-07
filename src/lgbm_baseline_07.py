@@ -30,7 +30,7 @@ OUT_IMPORTANCES = DATA_DIR / "processed" / "07_feature_importances.csv"
 OUT_MODEL       = DATA_DIR / "processed" / "07_lgbm_model.pkl"
 
 KEY_COLS  = ["rn_num", "rn_nom", "campagne_calc", "campagne_decade"]
-META_COLS = ["split", "effort_prospection", "label"]
+META_COLS = ["split", "effort_prospection", "label", "date_start"]
 
 GREGARITE_CATS = ["absent", "S", "St", "T", "G"]
 THRESHOLD_GRID = np.linspace(0.05, 0.50, 46)
