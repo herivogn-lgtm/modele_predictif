@@ -56,3 +56,7 @@ exports/
 scratch/
 tmp/
 *.log
+
+# PyTorch / NeuralProphet artefacts
+lightning_logs/
+*.ckpt
