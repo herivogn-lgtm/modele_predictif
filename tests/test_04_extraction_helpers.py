@@ -28,6 +28,23 @@ def test_build_decade_calendar_decade_id_unique_and_encoded():
     assert cal["decade_id"].is_unique
 
 
+# ── continuité malgré la lacune labels 2023-2024 ────────────────────────────────
+
+def test_build_decade_calendar_spans_label_gap_2023_2024():
+    """Les covariables GEE restent continues même là où les labels manquent.
+
+    La lacune labels 2023-2024 ne doit pas trouer le calendrier d'extraction :
+    chaque décade de campagne 1–30 est présente pour les années civiles 2023
+    et 2024, exactement comme pour une année hors lacune.
+    """
+    cal = h.build_decade_calendar([2022, 2023, 2024, 2025])
+    per_year = cal.groupby("year")["decade_num"].agg(["nunique", "min", "max"])
+    for year in (2023, 2024):
+        assert per_year.loc[year, "nunique"] == 30
+        assert per_year.loc[year, "min"] == 1
+        assert per_year.loc[year, "max"] == 30
+
+
 # ── build_specs (regroupement par année, fenêtre lead/lag) ──────────────────────
 
 def test_build_specs_groups_by_year_with_iso_window():
@@ -57,21 +74,21 @@ CHIRPS_RENAME = {
     "mean": "chirps_sum_mean", "stdDev": "chirps_sum_std",
     "min": "chirps_sum_min", "max": "chirps_sum_max",
 }
-CHIRPS_KEEP = ["region_id", "decade_id", "chirps_sum_mean", "chirps_sum_min",
+CHIRPS_KEEP = ["cell_id", "decade_id", "chirps_sum_mean", "chirps_sum_min",
                "chirps_sum_max", "chirps_sum_std"]
 
 
-def test_parse_reduce_features_renames_and_drops_region_nom():
+def test_parse_reduce_features_renames_and_drops_extra_props():
     props = [
-        {"region_id": 1, "decade_id": 201001, "region_nom": "RN1",
+        {"cell_id": "10_20", "decade_id": 201001, "AIRE_NOM": "Aire 1",
          "mean": 5.0, "stdDev": 1.0, "min": 0.0, "max": 9.0},
-        {"region_id": 2, "decade_id": 201001, "region_nom": "RN2",
+        {"cell_id": "10_21", "decade_id": 201001, "AIRE_NOM": "Aire 2",
          "mean": 3.0, "stdDev": 0.5, "min": 1.0, "max": 4.0},
     ]
     df = h.parse_reduce_features(props, CHIRPS_RENAME, CHIRPS_KEEP)
     assert list(df.columns) == CHIRPS_KEEP
-    assert "region_nom" not in df.columns
-    assert df.loc[df["region_id"] == 1, "chirps_sum_mean"].iloc[0] == 5.0
+    assert "AIRE_NOM" not in df.columns
+    assert df.loc[df["cell_id"] == "10_20", "chirps_sum_mean"].iloc[0] == 5.0
 
 
 def test_parse_reduce_features_empty_returns_keep_columns():
@@ -84,79 +101,94 @@ def test_parse_reduce_features_empty_returns_keep_columns():
 
 def test_compute_chirps_anomaly_subtracts_baseline():
     df = pd.DataFrame([
-        {"region_id": 1, "month": 10, "decade_part": 1, "chirps_sum_mean": 50.0},
-        {"region_id": 1, "month": 10, "decade_part": 2, "chirps_sum_mean": np.nan},
-        {"region_id": 2, "month": 10, "decade_part": 1, "chirps_sum_mean": 30.0},
-        {"region_id": 9, "month": 10, "decade_part": 1, "chirps_sum_mean": 12.0},  # pas de baseline
+        {"cell_id": "10_20", "month": 10, "decade_part": 1, "chirps_sum_mean": 50.0},
+        {"cell_id": "10_20", "month": 10, "decade_part": 2, "chirps_sum_mean": np.nan},
+        {"cell_id": "10_21", "month": 10, "decade_part": 1, "chirps_sum_mean": 30.0},
+        {"cell_id": "99_99", "month": 10, "decade_part": 1, "chirps_sum_mean": 12.0},  # pas de baseline
     ])
     baseline = pd.DataFrame([
-        {"region_id": 1, "month": 10, "decade_part": 1, "chirps_baseline_mean": 40.0},
-        {"region_id": 1, "month": 10, "decade_part": 2, "chirps_baseline_mean": 35.0},
-        {"region_id": 2, "month": 10, "decade_part": 1, "chirps_baseline_mean": 20.0},
+        {"cell_id": "10_20", "month": 10, "decade_part": 1, "chirps_baseline_mean": 40.0},
+        {"cell_id": "10_20", "month": 10, "decade_part": 2, "chirps_baseline_mean": 35.0},
+        {"cell_id": "10_21", "month": 10, "decade_part": 1, "chirps_baseline_mean": 20.0},
     ])
     out = h.compute_chirps_anomaly(df, baseline)
 
-    by = out.set_index(["region_id", "month", "decade_part"])["chirps_anomaly_mean"]
-    assert by[(1, 10, 1)] == 10.0
-    assert np.isnan(by[(1, 10, 2)])   # somme NaN → anomalie NaN
-    assert by[(2, 10, 1)] == 10.0
-    assert np.isnan(by[(9, 10, 1)])   # baseline absente → NaN
+    by = out.set_index(["cell_id", "month", "decade_part"])["chirps_anomaly_mean"]
+    assert by[("10_20", 10, 1)] == 10.0
+    assert np.isnan(by[("10_20", 10, 2)])   # somme NaN → anomalie NaN
+    assert by[("10_21", 10, 1)] == 10.0
+    assert np.isnan(by[("99_99", 10, 1)])   # baseline absente → NaN
     # la colonne baseline intermédiaire ne fuit pas dans la sortie
     assert "chirps_baseline_mean" not in out.columns
 
 
-# ── assemble_decades (calendrier × régions ⋈ sources) ───────────────────────────
+# ── assemble_decades (calendrier × cellules 1 km ⋈ sources) ─────────────────────
 
-def _regions_df():
-    return pd.DataFrame({"region_id": [1, 2], "region_nom": ["RN1", "RN2"]})
+def _cells_df():
+    """Grille 1 km clipée (issue 01) : cell_id + AIRE_CODE, pas de région naturelle."""
+    return pd.DataFrame({"cell_id": ["10_20", "10_21"], "AIRE_CODE": ["AMI", "ATM"]})
 
 
 def test_assemble_decades_cross_product_and_left_merge():
     cal = h.build_decade_calendar([2010])
     n_dec = len(cal)
     chirps = pd.DataFrame([
-        {"decade_id": 201001, "region_id": 1, "chirps_sum_mean": 5.0},
-        {"decade_id": 201001, "region_id": 2, "chirps_sum_mean": 7.0},
-        {"decade_id": 201002, "region_id": 1, "chirps_sum_mean": 3.0},
-        # (201002, région 2) absent → doit devenir NaN
+        {"decade_id": 201001, "cell_id": "10_20", "chirps_sum_mean": 5.0},
+        {"decade_id": 201001, "cell_id": "10_21", "chirps_sum_mean": 7.0},
+        {"decade_id": 201002, "cell_id": "10_20", "chirps_sum_mean": 3.0},
+        # (201002, cellule 10_21) absent → doit devenir NaN
     ])
-    out = h.assemble_decades(cal, _regions_df(), [chirps])
+    out = h.assemble_decades(cal, _cells_df(), [chirps])
 
-    # une ligne par (décade × région)
+    # une ligne par (décade × cellule 1 km)
     assert len(out) == n_dec * 2
-    # métadonnées présentes
-    for col in ["region_nom", "campaign", "decade_num", "date_start", "year", "month"]:
+    # métadonnées alignées sur les clés de jointure des labels (pipeline 03)
+    for col in ["cell_id", "AIRE_CODE", "campagne_calc", "campagne_decade",
+                "date_start", "year", "month"]:
         assert col in out.columns
+    # plus aucune trace de la région naturelle abandonnée
+    assert "region_id" not in out.columns
+    assert "region_nom" not in out.columns
 
     # valeurs jointes correctement
-    present = out[(out["month"] == 10) & (out["decade_part"] == 1) & (out["region_id"] == 1)]
+    present = out[(out["month"] == 10) & (out["decade_part"] == 1) & (out["cell_id"] == "10_20")]
     assert present["chirps_sum_mean"].iloc[0] == 5.0
-    missing = out[(out["month"] == 10) & (out["decade_part"] == 2) & (out["region_id"] == 2)]
+    missing = out[(out["month"] == 10) & (out["decade_part"] == 2) & (out["cell_id"] == "10_21")]
     assert np.isnan(missing["chirps_sum_mean"].iloc[0])
+
+
+def test_assemble_decades_decade_in_campaign_range():
+    """La décade de sortie est campagne_decade 1–30 (oct–juil), clé du pipeline 03."""
+    out = h.assemble_decades(h.build_decade_calendar([2010]), _cells_df(), [])
+    assert out["campagne_decade"].between(1, 30).all()
+    assert out["campagne_decade"].min() == 1
+    assert out["campagne_decade"].max() == 30
 
 
 def test_assemble_decades_merges_multiple_sources():
     cal = h.build_decade_calendar([2010])
-    chirps = pd.DataFrame([{"decade_id": 201001, "region_id": 1, "chirps_sum_mean": 5.0}])
-    ndvi = pd.DataFrame([{"decade_id": 201001, "region_id": 1, "ndvi_mean": 0.4}])
-    out = h.assemble_decades(cal, _regions_df(), [chirps, ndvi])
-    row = out[(out["month"] == 10) & (out["decade_part"] == 1) & (out["region_id"] == 1)]
+    chirps = pd.DataFrame([{"decade_id": 201001, "cell_id": "10_20", "chirps_sum_mean": 5.0}])
+    ndvi = pd.DataFrame([{"decade_id": 201001, "cell_id": "10_20", "ndvi_mean": 0.4}])
+    lst = pd.DataFrame([{"decade_id": 201001, "cell_id": "10_20", "lst_mean": 305.0}])
+    out = h.assemble_decades(cal, _cells_df(), [chirps, ndvi, lst])
+    row = out[(out["month"] == 10) & (out["decade_part"] == 1) & (out["cell_id"] == "10_20")]
     assert row["chirps_sum_mean"].iloc[0] == 5.0
     assert row["ndvi_mean"].iloc[0] == 0.4
+    assert row["lst_mean"].iloc[0] == 305.0
 
 
 # ── assert_decade_completeness (garde-fou) ──────────────────────────────────────
 
 def test_assert_decade_completeness_passes_when_full():
     cal = h.build_decade_calendar([2010])
-    out = h.assemble_decades(cal, _regions_df(), [])
+    out = h.assemble_decades(cal, _cells_df(), [])
     # ne doit pas lever
-    h.assert_decade_completeness(out, n_regions=2)
+    h.assert_decade_completeness(out, n_cells=2)
 
 
-def test_assert_decade_completeness_raises_on_missing_region():
+def test_assert_decade_completeness_raises_on_missing_cell():
     cal = h.build_decade_calendar([2010])
-    out = h.assemble_decades(cal, _regions_df(), [])
-    broken = out.iloc[1:]  # retire une ligne → une décade n'a plus que 1 région
+    out = h.assemble_decades(cal, _cells_df(), [])
+    broken = out.iloc[1:]  # retire une ligne → une décade n'a plus que 1 cellule
     with pytest.raises(AssertionError):
-        h.assert_decade_completeness(broken, n_regions=2)
+        h.assert_decade_completeness(broken, n_cells=2)

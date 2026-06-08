@@ -110,57 +110,64 @@ def parse_reduce_features(
 
 
 def compute_chirps_anomaly(df: pd.DataFrame, baseline_df: pd.DataFrame) -> pd.DataFrame:
-    """Ajoute `chirps_anomaly_mean = chirps_sum_mean − baseline` par région×décade-of-year.
+    """Ajoute `chirps_anomaly_mean = chirps_sum_mean − baseline` par cellule×décade-of-year.
 
-    Jointure sur (region_id, month, decade_part). NaN si la somme courante ou la
+    Jointure sur (cell_id, month, decade_part). NaN si la somme courante ou la
     baseline manque. La colonne baseline intermédiaire est retirée de la sortie.
     """
     out = df.merge(
-        baseline_df[["region_id", "month", "decade_part", "chirps_baseline_mean"]],
-        on=["region_id", "month", "decade_part"],
+        baseline_df[["cell_id", "month", "decade_part", "chirps_baseline_mean"]],
+        on=["cell_id", "month", "decade_part"],
         how="left",
     )
     out["chirps_anomaly_mean"] = out["chirps_sum_mean"] - out["chirps_baseline_mean"]
     return out.drop(columns=["chirps_baseline_mean"])
 
 
-# Métadonnées temporelles/spatiales en tête de la table de sortie
+# Métadonnées temporelles/spatiales en tête de la table de sortie.
+# Clés alignées sur les labels du pipeline 03 (cell_id × campagne_calc ×
+# campagne_decade) pour une jointure directe en aval (pipeline 06).
 _META_COLS = [
-    "region_id", "region_nom", "campaign", "decade_num",
+    "cell_id", "AIRE_CODE", "campagne_calc", "campagne_decade",
     "date_start", "date_end", "year", "month", "decade_part",
 ]
+
+# Renommage calendrier (vocabulaire interne) → vocabulaire de jointure labels.
+_CALENDAR_RENAME = {"campaign": "campagne_calc", "decade_num": "campagne_decade"}
 
 
 def assemble_decades(
     calendar_df: pd.DataFrame,
-    regions_df: pd.DataFrame,
+    cells_df: pd.DataFrame,
     source_dfs: list[pd.DataFrame],
 ) -> pd.DataFrame:
-    """Assemble la table décadaire : produit (décades × régions) ⋈ sources.
+    """Assemble la table décadaire : produit (décades × cellules 1 km) ⋈ sources.
 
-    `regions_df` : colonnes region_id, region_nom. Chaque DataFrame de
-    `source_dfs` est keyé sur (decade_id, region_id) ; merge gauche → NaN pour
-    les couples absents. Les colonnes techniques (decade_id, midpoint) sont
-    retirées pour préserver le schéma de sortie historique.
+    `cells_df` : grille 1 km clipée (issue 01) — colonnes cell_id, AIRE_CODE.
+    Chaque DataFrame de `source_dfs` est keyé sur (decade_id, cell_id) ; merge
+    gauche → NaN pour les couples absents. La sortie expose `campagne_calc` /
+    `campagne_decade` (clés des labels du pipeline 03) ; les colonnes techniques
+    (decade_id, midpoint) sont retirées.
     """
-    base = calendar_df.merge(regions_df, how="cross")
+    base = calendar_df.merge(cells_df, how="cross")
     for src in source_dfs:
-        if src is not None and not src.empty and "region_id" in src.columns:
-            base = base.merge(src, on=["decade_id", "region_id"], how="left")
+        if src is not None and not src.empty and "cell_id" in src.columns:
+            base = base.merge(src, on=["decade_id", "cell_id"], how="left")
+    base = base.rename(columns=_CALENDAR_RENAME)
     dyn = [c for c in base.columns if c not in _META_COLS + ["decade_id", "midpoint"]]
     return base[_META_COLS + dyn]
 
 
-def assert_decade_completeness(df: pd.DataFrame, n_regions: int) -> None:
-    """Garde-fou : chaque décade (year, decade_num) doit couvrir n_regions régions.
+def assert_decade_completeness(df: pd.DataFrame, n_cells: int) -> None:
+    """Garde-fou : chaque décade (year, campagne_decade) doit couvrir n_cells cellules.
 
     Remplace l'ancienne sonde `_collection_empty` par une vérification unique a
-    posteriori. Lève AssertionError si une décade a un nombre de régions distinct
+    posteriori. Lève AssertionError si une décade a un nombre de cellules distinct
     inattendu (extraction partielle, doublons, décade perdue).
     """
-    counts = df.groupby(["year", "decade_num"])["region_id"].nunique()
-    bad = counts[counts != n_regions]
+    counts = df.groupby(["year", "campagne_decade"])["cell_id"].nunique()
+    bad = counts[counts != n_cells]
     assert bad.empty, (
-        f"Décades incomplètes (≠ {n_regions} régions) : "
+        f"Décades incomplètes (≠ {n_cells} cellules) : "
         f"{bad.to_dict()}"
     )
