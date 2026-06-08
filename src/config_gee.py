@@ -22,9 +22,11 @@ PATHS = {
     "baseline_cache": DATA_DIR / "processed" / "04_chirps_baseline_cache.parquet",
 }
 
-# Nombre de cellules par tuile (1 getInfo borné). Tiling spatial pour ne pas
-# saturer reduceRegions/sampleRegions sur les ~181 000 cellules d'un coup.
-CELL_CHUNK_SIZE = 5000
+# Nombre de cellules par tuile. GEE abandonne tout getInfo de FeatureCollection
+# au-delà de **5000 éléments** ; comme la bissection ne réduit que la dimension
+# décades, la tuile doit rester < 5000 cellules pour qu'un appel mono-décade
+# (cells × 1) tienne. Marge volontaire sous 5000.
+CELL_CHUNK_SIZE = 4500
 
 # ── Plage temporelle ──────────────────────────────────────────────────────────
 YEARS = list(range(2001, 2027))

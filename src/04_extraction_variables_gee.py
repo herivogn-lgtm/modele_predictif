@@ -68,6 +68,12 @@ GETINFO_MAX_WORKERS = 6
 # sur des sampleRegions denses (beaucoup de points par requête).
 SAMPLE_TILE_SCALE = 4
 
+# Budget d'éléments par getInfo (< limite GEE de 5000). Le nombre de features
+# renvoyées = cellules × décades de l'appel : on **sous-tuile les cellules** pour
+# que tout un an (≈30 décades) tienne en un seul appel propre (≈150 cellules),
+# au lieu de forcer la bissection à descendre à 1 décade par appel.
+GETINFO_ELEMENT_BUDGET = 4500
+
 
 # ── 1. Chargement de la grille 1 km ─────────────────────────────────────────────
 
@@ -123,15 +129,45 @@ def points_fc(chunk_df: pd.DataFrame) -> ee.FeatureCollection:
     )
 
 
+def _cell_batches(chunk_df: pd.DataFrame, n_specs: int):
+    """Sous-tuile les cellules pour qu'un appel (cellules × n_specs) tienne sous le budget."""
+    batch = max(1, GETINFO_ELEMENT_BUDGET // max(1, n_specs))
+    for i in range(0, len(chunk_df), batch):
+        yield chunk_df.iloc[i:i + batch]
+
+
 # ── 2. Utilitaires GEE ────────────────────────────────────────────────────────
 
+# Erreurs déterministes liées à la taille/au coût d'un getInfo : inutile de
+# retenter à l'identique (perte de temps) — on les laisse remonter pour que la
+# bissection des specs réduise immédiatement le volume de l'appel.
+_SIZE_ERROR_MARKERS = (
+    "aborted after accumulating",       # > 5000 éléments dans la FeatureCollection
+    "Collection query aborted",
+    "Computation timed out",
+    "User memory limit exceeded",
+    "payload size exceeds",
+)
+
+
+def _is_size_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(m in msg for m in _SIZE_ERROR_MARKERS)
+
+
 def gee_call_with_retry(fn):
-    """Exécute fn() avec retry exponentiel sur EEException (rate limit / 5xx)."""
+    """Exécute fn() avec retry exponentiel sur EEException **transitoire** (rate limit / 5xx).
+
+    Les erreurs de taille/coût (déterministes) remontent immédiatement → gérées
+    par la bissection en amont.
+    """
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
             return fn()
         except ee.EEException as exc:
+            if _is_size_error(exc):
+                raise
             last_exc = exc
             wait = RETRY_BACKOFF_BASE**attempt
             print(f"    GEE erreur (tentative {attempt + 1}/{MAX_RETRIES}): {exc} — attente {wait}s")
@@ -229,17 +265,24 @@ def _sample_specs(image_fn, specs: list[dict], fc_pts, scale: int,
                 + _sample_specs(image_fn, specs[mid:], fc_pts, scale, key))
 
 
-def extract_source(image_fn, specs_by_year: dict, fc_pts, scale: int,
+def extract_source(image_fn, specs_by_year: dict, chunk_df: pd.DataFrame, scale: int,
                    rename: dict, keep: list[str], label: str) -> pd.DataFrame:
-    """Extrait une source dynamique sur toutes les années (getInfo parallélisés)."""
-    years = sorted(specs_by_year)
+    """Extrait une source dynamique : 1 getInfo par (an × sous-tuile de cellules).
 
-    def one_year(year: int) -> pd.DataFrame:
-        props = _sample_specs(image_fn, specs_by_year[year], fc_pts, scale)
+    Chaque appel couvre toutes les décades d'une année sur un paquet de cellules
+    dimensionné pour tenir sous le budget GEE. Appels parallélisés.
+    """
+    units = [(specs_by_year[y], sub)
+             for y in sorted(specs_by_year)
+             for sub in _cell_batches(chunk_df, len(specs_by_year[y]))]
+
+    def one(unit) -> pd.DataFrame:
+        specs, sub = unit
+        props = _sample_specs(image_fn, specs, points_fc(sub), scale)
         return parse_reduce_features(props, rename, keep)
 
     with ThreadPoolExecutor(max_workers=GETINFO_MAX_WORKERS) as ex:
-        dfs = list(ex.map(one_year, years))
+        dfs = list(ex.map(one, units))
     out = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=keep)
     print(f"    {label} OK ({len(out)} lignes)")
     return out
@@ -258,13 +301,13 @@ LST_RENAME = {"lst": "lst_mean"}
 LST_KEEP = ["cell_id", "decade_id", "lst_mean"]
 
 
-def extract_dynamic_chunk(fc_pts, calendar: pd.DataFrame) -> list[pd.DataFrame]:
+def extract_dynamic_chunk(chunk_df: pd.DataFrame, calendar: pd.DataFrame) -> list[pd.DataFrame]:
     """Extrait CHIRPS + NDVI/EVI + LST pour une tuile de cellules (table longue)."""
-    chirps_df = extract_source(_chirps_image, build_specs(calendar, 0, 1), fc_pts, 5566,
+    chirps_df = extract_source(_chirps_image, build_specs(calendar, 0, 1), chunk_df, 5566,
                                CHIRPS_RENAME, CHIRPS_KEEP, "CHIRPS")
-    ndvi_df = extract_source(_ndvi_evi_image, build_specs(calendar, 8, 9), fc_pts, 250,
+    ndvi_df = extract_source(_ndvi_evi_image, build_specs(calendar, 8, 9), chunk_df, 250,
                              NDVI_RENAME, NDVI_KEEP, "NDVI/EVI")
-    lst_df = extract_source(_lst_image, build_specs(calendar, 4, 5), fc_pts, 1000,
+    lst_df = extract_source(_lst_image, build_specs(calendar, 4, 5), chunk_df, 1000,
                             LST_RENAME, LST_KEEP, "LST")
     return [chirps_df, ndvi_df, lst_df]
 
@@ -318,9 +361,9 @@ def compute_chirps_baseline_stats(
 
     parts = []
     for ci, chunk in enumerate(chunks):
-        fc_pts = points_fc(chunk)
-        props = _sample_specs(image_fn, specs, fc_pts, 5566, key="doy_id")
-        parts.append(parse_reduce_features(props, BASELINE_RENAME, BASELINE_KEEP))
+        for sub in _cell_batches(chunk, len(specs)):
+            props = _sample_specs(image_fn, specs, points_fc(sub), 5566, key="doy_id")
+            parts.append(parse_reduce_features(props, BASELINE_RENAME, BASELINE_KEEP))
         print(f"  tuile {ci + 1}/{len(chunks)} OK")
 
     df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=BASELINE_KEEP)
@@ -360,8 +403,8 @@ def validate_ranges(df: pd.DataFrame) -> None:
 def run_integration_test(cells_df: pd.DataFrame) -> None:
     """Teste chaque extracteur sur une seule cellule et une décade (janvier 2010 D1)."""
     print("\n=== Test d'intégration : 1 cellule, janvier 2010 D1 ===")
-    fc_pts = points_fc(cells_df.iloc[[0]])
-    print(f"  cellule de test : {cells_df['cell_id'].iloc[0]}")
+    one_cell = cells_df.iloc[[0]]
+    print(f"  cellule de test : {one_cell['cell_id'].iloc[0]}")
 
     calendar = build_decade_calendar([2010])
     one = calendar[(calendar["month"] == 1) & (calendar["decade_part"] == 1)]
@@ -371,18 +414,18 @@ def run_integration_test(cells_df: pd.DataFrame) -> None:
         spec = next(s for s in build_specs(calendar, lead, lag)[2010] if s["id"] == did)
         return {2010: [spec]}
 
-    df = extract_source(_chirps_image, _one_spec(0, 1), fc_pts, 5566,
+    df = extract_source(_chirps_image, _one_spec(0, 1), one_cell, 5566,
                         CHIRPS_RENAME, CHIRPS_KEEP, "CHIRPS")
     assert df.empty or (df["chirps_sum_mean"].dropna() >= 0).all(), "CHIRPS : négatif"
     print("  CHIRPS somme : OK")
 
-    df = extract_source(_ndvi_evi_image, _one_spec(8, 9), fc_pts, 250,
+    df = extract_source(_ndvi_evi_image, _one_spec(8, 9), one_cell, 250,
                         NDVI_RENAME, NDVI_KEEP, "NDVI/EVI")
     if not df.empty and "ndvi_mean" in df.columns:
         assert df["ndvi_mean"].dropna().between(-1, 1).all(), "NDVI hors plage"
     print("  NDVI/EVI     : OK")
 
-    df = extract_source(_lst_image, _one_spec(4, 5), fc_pts, 1000,
+    df = extract_source(_lst_image, _one_spec(4, 5), one_cell, 1000,
                         LST_RENAME, LST_KEEP, "LST")
     if not df.empty and "lst_mean" in df.columns:
         assert df["lst_mean"].dropna().between(200, 400).all(), "LST hors plage Kelvin"
@@ -436,8 +479,7 @@ def run(years: list[int] = YEARS, test_only: bool = False) -> None:
     total_rows = 0
     for ci, chunk in enumerate(chunks):
         print(f"\n── Tuile {ci + 1}/{len(chunks)} ({len(chunk)} cellules) ──")
-        fc_pts = points_fc(chunk)
-        source_dfs = extract_dynamic_chunk(fc_pts, calendar)
+        source_dfs = extract_dynamic_chunk(chunk, calendar)
 
         part = assemble_decades(calendar, cells_table(chunk), source_dfs)
         part = compute_chirps_anomaly(part, baseline_df)
