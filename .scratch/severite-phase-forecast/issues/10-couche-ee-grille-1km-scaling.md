@@ -84,6 +84,24 @@ Options d'archi à trancher (needs-info) :
   noms de propriétés réels renvoyés par sampleRegions, construction server-side
   `points_fc`. → lancer `--test-only`.
 
+## Variante Export.table livrée (2026-06-08, option 3/B)
+
+Le getInfo (#04) reste correct mais demande **~86 600 appels** à 181k cellules
+(plancher imposé par le plafond GEE de 5000 éléments/getInfo). Variante scalable
+ajoutée : **`src/04b_export_variables_gee.py`** (Export.table, pas de plafond).
+
+- Primitives GEE (images, QA, `points_fc`, `sample_fc`, baseline) extraites dans
+  **`src/extraction_gee_sources.py`**, partagées par #04 et #04b → valeurs identiques.
+  #04 refactoré pour les importer (registre `DYNAMIC_SOURCES`).
+- 04b en 3 étapes (Drive = tampon) : `submit` (52 tâches : 3 sources × 13 tuiles
+  toutes années + 13 baseline) → `status`/`cancel` → télécharger Drive →
+  `assemble` (CSV→parquet partitionné, par tuile pour borner la mémoire).
+- Config : `POINT_EXPORT_TILE=15000`, `EXPORT_DRIVE_FOLDER`, `PATHS["exports_dir"]`.
+- Vérifié hors GEE : imports, refactor #04, `grid_tiles` (13 tuiles/52 tâches),
+  `_flatten_specs` (decade_id unique), chaîne `assemble` sur CSV synthétiques
+  multi-shards. Helpers ee-free : 11 verts. **Non vérifié** (auth) : soumission/
+  exécution des tâches Export, format réel des CSV Drive.
+
 ## Aval impacté (hors périmètre, à traiter)
 
 - `src/feature_engineering_05.py` lit `04_variables_environnementales.parquet`

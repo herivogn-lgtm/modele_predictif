@@ -20,6 +20,9 @@ PATHS = {
     "grille_parquet": DATA_DIR / "processed" / "01_grille_1km.parquet",
     "output_dir": DATA_DIR / "processed" / "04_variables_environnementales",
     "baseline_cache": DATA_DIR / "processed" / "04_chirps_baseline_cache.parquet",
+    # Pipeline 04b : dossier local où l'utilisateur dépose les CSV téléchargés
+    # depuis Drive (sortie des tâches Export) avant l'étape --assemble.
+    "exports_dir": DATA_DIR / "processed" / "04_exports_drive",
 }
 
 # Nombre de cellules par tuile. GEE abandonne tout getInfo de FeatureCollection
@@ -27,6 +30,13 @@ PATHS = {
 # décades, la tuile doit rester < 5000 cellules pour qu'un appel mono-décade
 # (cells × 1) tienne. Marge volontaire sous 5000.
 CELL_CHUNK_SIZE = 4500
+
+# ── Pipeline 04b (Export.table, sans plafond 5000) ──────────────────────────────
+# Cellules par tâche d'export : borne la taille de l'expression FC envoyée à GEE
+# (pas de limite sur le nombre de lignes exportées, contrairement à getInfo).
+POINT_EXPORT_TILE = 15000
+# Dossier Google Drive cible des tâches Export (créé automatiquement par GEE).
+EXPORT_DRIVE_FOLDER = "ee_exports_locusta_v04"
 
 # ── Plage temporelle ──────────────────────────────────────────────────────────
 YEARS = list(range(2001, 2027))
