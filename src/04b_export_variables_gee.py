@@ -36,6 +36,7 @@ from config_gee import (
     PATHS,
     POINT_EXPORT_TILE,
     YEARS,
+    YEARS_PER_TASK,
 )
 from extraction_gee_helpers import (
     assemble_decades,
@@ -84,6 +85,12 @@ def _flatten_specs(specs_by_year: dict) -> list[dict]:
     return [s for year in sorted(specs_by_year) for s in specs_by_year[year]]
 
 
+def _year_batches(years: list[int], n: int = YEARS_PER_TASK) -> list[list[int]]:
+    """Découpe les années en lots de ≤ n (borne la taille de chaque tâche d'export)."""
+    ys = sorted(years)
+    return [ys[i:i + n] for i in range(0, len(ys), n)]
+
+
 def _start_export(fcol: ee.FeatureCollection, name: str, selectors: list[str]) -> ee.batch.Task:
     """Crée et démarre une tâche Export.table.toDrive (CSV)."""
     task = ee.batch.Export.table.toDrive(
@@ -98,31 +105,43 @@ def _start_export(fcol: ee.FeatureCollection, name: str, selectors: list[str]) -
     return task
 
 
-def submit(years: list[int] = YEARS) -> list[ee.batch.Task]:
-    """Crée une tâche d'export par (source × tuile, toutes années) + baseline par tuile."""
+def submit(years: list[int] = YEARS, baseline: bool = True, dynamic: bool = True) -> list[ee.batch.Task]:
+    """Lance les tâches d'export.
+
+    Dynamique : une tâche par (source × **lot d'années** × tuile) — petits lots
+    (`YEARS_PER_TASK`) pour que chaque tâche reste courte/peu coûteuse. Baseline :
+    une tâche par tuile (déjà légère). `baseline`/`dynamic` permettent de ne
+    relancer qu'une partie (ex. baseline déjà terminée → --no-baseline).
+    """
     init_gee()
     cells_df = load_grid(PATHS["grille_parquet"])
     tiles = grid_tiles(cells_df)
-    calendar = build_decade_calendar(years)
-    print(f"{len(cells_df)} cellules → {len(tiles)} tuiles de ≤ {POINT_EXPORT_TILE}.")
+    batches = _year_batches(years)
+    print(f"{len(cells_df)} cellules → {len(tiles)} tuiles de ≤ {POINT_EXPORT_TILE} ; "
+          f"{len(batches)} lots d'années (≤ {YEARS_PER_TASK} ans).")
 
     tasks: list[ee.batch.Task] = []
 
     # Baseline CHIRPS (décade-of-year) — une tâche par tuile.
-    bimg = baseline_image_fn(CHIRPS_BASELINE_YEARS)
-    for ti, sub in tiles:
-        fcol = sample_fc(bimg, _BASELINE_SPECS, points_fc(sub), 5566, key="doy_id")
-        name = f"{EXPORT_PREFIX}_BASELINE_t{ti:03d}"
-        tasks.append(_start_export(fcol, name, ["cell_id", "doy_id", "chirps_baseline"]))
-
-    # Sources dynamiques — une tâche par (source × tuile), toutes années.
-    for src in DYNAMIC_SOURCES:
-        specs = _flatten_specs(build_specs(calendar, src["lead"], src["lag"]))
-        selectors = ["cell_id", "decade_id"] + src["bands"]
+    if baseline:
+        bimg = baseline_image_fn(CHIRPS_BASELINE_YEARS)
         for ti, sub in tiles:
-            fcol = sample_fc(src["image_fn"], specs, points_fc(sub), src["scale"])
-            name = f"{EXPORT_PREFIX}_{src['name']}_t{ti:03d}"
-            tasks.append(_start_export(fcol, name, selectors))
+            fcol = sample_fc(bimg, _BASELINE_SPECS, points_fc(sub), 5566, key="doy_id")
+            name = f"{EXPORT_PREFIX}_BASELINE_t{ti:03d}"
+            tasks.append(_start_export(fcol, name, ["cell_id", "doy_id", "chirps_baseline"]))
+
+    # Sources dynamiques — une tâche par (source × lot d'années × tuile).
+    if dynamic:
+        for src in DYNAMIC_SOURCES:
+            selectors = ["cell_id", "decade_id"] + src["bands"]
+            for batch in batches:
+                specs = _flatten_specs(build_specs(build_decade_calendar(batch),
+                                                   src["lead"], src["lag"]))
+                label = f"y{batch[0]}"
+                for ti, sub in tiles:
+                    fcol = sample_fc(src["image_fn"], specs, points_fc(sub), src["scale"])
+                    name = f"{EXPORT_PREFIX}_{src['name']}_{label}_t{ti:03d}"
+                    tasks.append(_start_export(fcol, name, selectors))
 
     print(f"\n{len(tasks)} tâches d'export lancées vers Drive/{EXPORT_DRIVE_FOLDER}.")
     print("Suivre : python src/04b_export_variables_gee.py status")
@@ -175,7 +194,8 @@ def cancel() -> None:
 def _read_source_csvs(exports_dir: Path, source_name: str, ti: int,
                       rename: dict, keep: list[str]) -> pd.DataFrame:
     """Lit + concatène tous les shards CSV d'une (source, tuile), renomme et filtre."""
-    pattern = f"{EXPORT_PREFIX}_{source_name}_t{ti:03d}*.csv"
+    # nom = v04_<source>_y<année>_t<tuile>[<shard>].csv → joker sur le lot d'années
+    pattern = f"{EXPORT_PREFIX}_{source_name}_*_t{ti:03d}*.csv"
     files = sorted(exports_dir.glob(pattern))
     if not files:
         raise FileNotFoundError(f"Aucun CSV pour {pattern} dans {exports_dir}")
@@ -241,10 +261,14 @@ if __name__ == "__main__":
                         help="Années civiles (défaut : toute la fenêtre)")
     parser.add_argument("--exports-dir", default=None,
                         help="Dossier des CSV téléchargés (défaut : PATHS['exports_dir'])")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="submit : ne pas relancer la baseline (déjà terminée)")
+    parser.add_argument("--no-dynamic", action="store_true",
+                        help="submit : ne lancer que la baseline")
     args = parser.parse_args()
 
     if args.mode == "submit":
-        submit(years=args.years)
+        submit(years=args.years, baseline=not args.no_baseline, dynamic=not args.no_dynamic)
     elif args.mode == "status":
         status()
     elif args.mode == "cancel":

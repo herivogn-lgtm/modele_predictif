@@ -37,6 +37,10 @@ CELL_CHUNK_SIZE = 4500
 POINT_EXPORT_TILE = 15000
 # Dossier Google Drive cible des tâches Export (créé automatiquement par GEE).
 EXPORT_DRIVE_FOLDER = "ee_exports_locusta_v04"
+# Années par tâche dynamique. Mettre TOUTES les années dans une tâche rend chaque
+# tâche gigantesque (780 décades × 15k points → heures + milliers d'EECU-h) : on
+# borne à quelques années → tâches courtes, reprenables, peu coûteuses.
+YEARS_PER_TASK = 3
 
 # ── Plage temporelle ──────────────────────────────────────────────────────────
 YEARS = list(range(2001, 2027))
