@@ -44,7 +44,8 @@ DATA_DIR     = Path(__file__).parent.parent / "data"
 IN_PARQUET   = DATA_DIR / "processed" / "06_table_entrainement_unifiee.parquet"
 IN_CHOIX     = DATA_DIR / "processed" / "07_modele_retenu.txt"
 IN_GRILLE    = DATA_DIR / "processed" / "01_grille_1km.parquet"
-IN_AIRE      = DATA_DIR / "aire_gregarigene"   # contour de contexte (repli hors-ligne)
+IN_AIRE      = DATA_DIR / "aire_gregarigene"   # secteurs grégarigènes (contour de contexte)
+IN_RN        = DATA_DIR / "region_naturelle"   # régions naturelles (fond de carte de base)
 
 OUT_DIR              = DATA_DIR / "processed"
 OUT_CARTE_DECADE     = OUT_DIR / "09_carte_severite_decade.csv"
@@ -180,47 +181,47 @@ def _export_raster(gdf) -> None:
 
 
 def _export_png(gdf) -> None:
-    """Rendu cartographique PNG : cellules de sévérité 0–3 superposées à un fond de carte.
+    """Rendu cartographique PNG : cellules de sévérité 0–3 sur un fond de cartes locales.
 
-    Les cellules prédites sont tracées en semi-transparence (`PNG_ALPHA`) au-dessus d'un
-    fond de carte web (contextily). Repli automatique hors-ligne : contour de l'aire
-    grégarigène en fond si les tuiles sont indisponibles (`SORTIES_BASEMAP=0` force le repli).
+    Fond de carte = couches locales (pas de tuiles web) : `region_naturelle` (fond gris
+    clair) puis `aire_gregarigene` (contour des secteurs). Les cellules prédites sont
+    tracées en semi-transparence (`PNG_ALPHA`) par-dessus. La vue est cadrée sur l'emprise
+    des cellules (zoom sur la zone de prédiction), les couches de fond servant de repères.
     """
-    import os
-
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import BoundaryNorm, ListedColormap
 
+    import geopandas as gpd
+
     cmap = ListedColormap(["#e8e8e8", "#ffe08a", "#fb8c3c", "#c0202a"])  # 0/1/2/3
     norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
 
-    # Web Mercator (EPSG:3857) requis par les tuiles contextily.
-    gweb = gdf.to_crs(epsg=3857)
-
+    crs = gdf.crs
     fig, ax = plt.subplots(figsize=(9, 11))
-    gweb.plot(column=SEV_COL, cmap=cmap, norm=norm, ax=ax,
-              linewidth=0, alpha=PNG_ALPHA, zorder=2)
 
-    basemap_ok = False
-    if os.environ.get("SORTIES_BASEMAP", "1") != "0":
-        try:
-            import contextily as cx
-            cx.add_basemap(ax, crs=gweb.crs, source=cx.providers.CartoDB.Positron,
-                           attribution_size=6)
-            basemap_ok = True
-        except Exception as exc:  # noqa: BLE001 — pas de réseau / tuiles : on bascule en repli
-            print(f"  [!] fond de carte web indisponible ({type(exc).__name__}) — repli contour.")
+    # Fond de carte local : régions naturelles (remplissage) + secteurs grégarigènes (contour).
+    try:
+        rn = gpd.read_file(IN_RN).to_crs(crs)
+        rn.plot(ax=ax, facecolor="#f0ede6", edgecolor="#c8c2b6", linewidth=0.4, zorder=0)
+    except Exception:  # noqa: BLE001 — fond facultatif
+        pass
+    try:
+        aire = gpd.read_file(IN_AIRE).to_crs(crs)
+        aire.boundary.plot(ax=ax, color="#6b6157", linewidth=0.8, zorder=1)
+    except Exception:  # noqa: BLE001 — contour facultatif
+        pass
 
-    # Repli / contexte : contour de l'aire grégarigène sous les cellules.
-    if not basemap_ok:
-        try:
-            import geopandas as gpd
-            aire = gpd.read_file(IN_AIRE).to_crs(epsg=3857)
-            aire.boundary.plot(ax=ax, color="#555555", linewidth=0.6, zorder=1)
-        except Exception:  # noqa: BLE001 — le contour est facultatif
-            pass
+    # Cellules prédites au-dessus du fond.
+    gdf.plot(column=SEV_COL, cmap=cmap, norm=norm, ax=ax,
+             linewidth=0, alpha=PNG_ALPHA, zorder=2)
+
+    # Cadrer sur l'emprise des cellules (+ marge), le fond servant de contexte.
+    minx, miny, maxx, maxy = gdf.total_bounds
+    mx, my = (maxx - minx) * 0.06, (maxy - miny) * 0.06
+    ax.set_xlim(minx - mx, maxx + mx)
+    ax.set_ylim(miny - my, maxy + my)
 
     ax.set_title("Sévérité-phase prédite 0–3 (décade T+1) — aire grégarigène 1 km")
     ax.set_axis_off()
@@ -232,7 +233,7 @@ def _export_png(gdf) -> None:
     fig.tight_layout()
     fig.savefig(OUT_PNG, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {OUT_PNG}" + ("  (fond de carte web)" if basemap_ok else "  (repli contour)"))
+    print(f"  -> {OUT_PNG}  (fond cartes locales)")
 
 
 # ---------------------------------------------------------------------------
