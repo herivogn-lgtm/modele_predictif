@@ -67,9 +67,15 @@ L'orchestration `run()` (non testée) entraîne le modèle retenu sur l'historiq
 
 ```bash
 ./.venv/bin/python src/sorties_operationnelles_09.py
+
+# Prévisualiser un autre modèle / une autre campagne sans relancer #07 :
+SORTIES_MODELE=catboost SORTIES_CAMPAGNE=2025-2026 ./.venv/bin/python src/sorties_operationnelles_09.py
 ```
 
-Le script s'adapte automatiquement au modèle retenu via `07_modele_retenu.txt` : après un nouveau run de référence #07, le relancer régénère les cartes.
+- **Modèle** : par défaut le modèle retenu (`07_modele_retenu.txt`) ; override via `SORTIES_MODELE` (`catboost`, `random_forest`, `lightgbm`, `xgboost`, `regression_ordinale`, `lstm`).
+- **Campagne cible** : par défaut la **dernière campagne ayant une couverture environnementale suffisante** (NDVI ≥ `MIN_COUVERTURE_FEATURES`, défaut 50 %). La toute dernière campagne du calendrier peut être un **futur non encore extrait par GEE** (features 100 % NaN → carte plate) : elle est automatiquement ignorée. Override via `SORTIES_CAMPAGNE`.
+
+> ⚠️ Un vrai forecast de la campagne future (ex. 2026-2027) nécessite d'abord d'**extraire ses covariables GEE** ([#04](04-extraction-gee.md)). Sans cela, seules les campagnes déjà couvertes produisent une carte exploitable.
 
 ---
 

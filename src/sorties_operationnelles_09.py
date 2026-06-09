@@ -66,6 +66,8 @@ SEV_PRESENCE    = 1   # binaire dérivé : présence = sévérité ≥ 1 (PRD)
 SEV_FOYER       = 2   # foyer à prospecter en priorité = sévérité ≥ 2 (transiens/grégaire)
 DECADES_PAR_MOIS = 3  # mois-campagne = 3 décades consécutives (décade 1–36 → mois 1–12)
 PNG_ALPHA        = 0.75  # transparence des cellules sur le fond de carte (0=invisible, 1=opaque)
+CLE_COUVERTURE        = "ndvi_mean"  # feature témoin pour juger la couverture environnementale
+MIN_COUVERTURE_FEATURES = 0.5        # seuil mini de couverture pour cibler une campagne (sinon carte plate)
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +242,32 @@ def _export_png(gdf) -> None:
 # Point d'entrée — entraînement modèle retenu + prédiction décade T+1
 # ---------------------------------------------------------------------------
 
+def _choisir_campagne_cible(a_pred: pd.DataFrame) -> str:
+    """Dernière campagne à prédire ayant une couverture environnementale suffisante.
+
+    Override : variable d'env `SORTIES_CAMPAGNE`. Sinon, on retient la campagne la plus
+    récente dont la couverture de `CLE_COUVERTURE` (NDVI) dépasse `MIN_COUVERTURE_FEATURES` ;
+    à défaut, la plus récente du calendrier (avec avertissement).
+    """
+    import os
+
+    forcee = os.environ.get("SORTIES_CAMPAGNE", "").strip()
+    campagnes = sorted(a_pred[CAMP_COL].dropna().unique())
+    if forcee:
+        return forcee
+    couverture = a_pred.groupby(CAMP_COL)[CLE_COUVERTURE].apply(lambda s: float(s.notna().mean()))
+    eligibles = [c for c in campagnes if couverture.get(c, 0.0) >= MIN_COUVERTURE_FEATURES]
+    if eligibles:
+        cible = eligibles[-1]
+        if cible != campagnes[-1]:
+            print(f"  [i] campagne {campagnes[-1]} ignorée (features insuffisantes) "
+                  f"→ cible {cible} (couverture NDVI {couverture[cible]:.0%}).")
+        return cible
+    print(f"  [!] aucune campagne avec couverture ≥ {MIN_COUVERTURE_FEATURES:.0%} ; "
+          f"repli sur {campagnes[-1]} — carte probablement plate.")
+    return campagnes[-1]
+
+
 def run() -> None:
     import os
 
@@ -258,15 +286,18 @@ def run() -> None:
     medians = obs[feature_cols].median(numeric_only=True)
     obs[feature_cols] = obs[feature_cols].fillna(medians)
 
-    # Emprise = dernière campagne à prédire (décade T+1, alerte précoce).
+    # Emprise = dernière campagne à prédire qui a un vrai signal environnemental.
+    # (La toute dernière campagne du calendrier peut être un futur non encore extrait
+    #  par GEE → features 100 % NaN → carte plate. On l'évite, override possible.)
     a_pred = df[df["a_predire"].astype(bool)].copy()
-    campagne_cible = sorted(a_pred[CAMPAIGN_COL].dropna().unique())[-1]
+    campagne_cible = _choisir_campagne_cible(a_pred)
     pred = a_pred[a_pred[CAMPAIGN_COL] == campagne_cible].copy()
     pred[feature_cols] = pred[feature_cols].fillna(medians)
     print(f"  {len(obs)} lignes observées | campagne cible {campagne_cible} : "
           f"{len(pred)} cellules-décades à prédire")
 
-    retenu = _lire_modele_retenu(IN_CHOIX)
+    # Override manuel possible (prévisualisation d'un autre modèle sans relancer #07).
+    retenu = os.environ.get("SORTIES_MODELE", "").strip() or _lire_modele_retenu(IN_CHOIX)
     n_estimators = int(os.environ.get("BENCH_N_ESTIMATORS", "300"))
     n_jobs       = int(os.environ.get("BENCH_N_JOBS", "-1"))
     spec = build_models(n_estimators=n_estimators, n_jobs=n_jobs, include_lstm=True)[retenu]
