@@ -1,217 +1,239 @@
-"""Tests unitaires et intégration — Issue #03 : Labels d'entraînement par région × décade."""
+"""Tests unitaires et intégration — Issue #02 : Cible ordinale sévérité-phase 0–3.
+
+Pipeline #03 agrège les relevés à la maille cellule 1 km × décade et produit :
+  - severite : ordinale 0–3 = phase maximale observée (imago + larve)
+  - binaire  : sévérité ≥ 1 (présence), dérivé pour l'AUC
+  - intensite: log1p(densité moyenne), optionnelle et non bloquante (~35 % NaN)
+"""
 
 import sys
 from pathlib import Path
 
+import math
 import pytest
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import labels_entrainement_03 as pipeline
 
-DATA_DIR   = Path(__file__).parent.parent / "data"
-PARQUET_OUT = DATA_DIR / "processed" / "03_labels_region_decade.parquet"
+DATA_DIR    = Path(__file__).parent.parent / "data"
+PARQUET_OUT = DATA_DIR / "processed" / "03_labels_cellule_decade.parquet"
+
+PHASE_COLS = ["Sol", "Sol_larve", "Trans", "Trans_larve", "Greg", "Greg_larve"]
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_group(*sol_trans_greg_tuples):
-    """Construit un DataFrame groupe depuis des tuples (Sol, Trans, Greg)."""
-    rows = [{"Sol": s, "Trans": t, "Greg": g} for s, t, g in sol_trans_greg_tuples]
-    return pd.DataFrame(rows)
+def _make_group(rows: list[dict]) -> pd.DataFrame:
+    """Groupe de relevés ; colonnes de phase absentes → 0.0, densité → NaN."""
+    defaults = {c: 0.0 for c in PHASE_COLS}
+    defaults["densite_imago"] = float("nan")
+    return pd.DataFrame([{**defaults, **r} for r in rows])
 
+
+# ---------------------------------------------------------------------------
+# compute_severite
+# ---------------------------------------------------------------------------
+
+def test_severite_greg_donne_3():
+    group = _make_group([{"Greg": 4.0}])
+    assert pipeline.compute_severite(group) == 3
+
+
+@pytest.mark.parametrize("row, expected", [
+    ({"Greg": 4.0},        3),
+    ({"Greg_larve": 1.0},  3),  # larve compte autant que l'imago
+    ({"Trans": 2.0},       2),
+    ({"Trans_larve": 5.0}, 2),
+    ({"Sol": 1.0},         1),
+    ({"Sol_larve": 3.0},   1),
+    ({},                   0),  # tous les comptages observés à zéro → vraie absence
+])
+def test_severite_cas_canoniques(row, expected):
+    assert pipeline.compute_severite(_make_group([row])) == expected
+
+
+def test_severite_phase_max_quand_plusieurs():
+    """Plusieurs phases présentes → la phase la plus haute gouverne."""
+    group = _make_group([{"Sol": 10.0, "Trans": 4.0, "Greg": 1.0}])
+    assert pipeline.compute_severite(group) == 3
+
+
+def test_severite_phase_max_entre_lignes():
+    """Le max porte sur l'ensemble du groupe, pas une seule ligne."""
+    group = _make_group([{"Sol": 5.0}, {"Trans": 2.0}, {}])
+    assert pipeline.compute_severite(group) == 2
+
+
+def test_severite_tout_nan_donne_na():
+    """Aucune valeur observée (tout NaN) → NA, pas une absence (0)."""
+    nan = float("nan")
+    group = _make_group([{c: nan for c in PHASE_COLS}])
+    assert pd.isna(pipeline.compute_severite(group))
+
+
+def test_severite_zero_explicite_nest_pas_na():
+    """Des zéros explicites → vraie absence (0), distinct du NaN."""
+    group = _make_group([{}])  # toutes les phases à 0.0
+    assert pipeline.compute_severite(group) == 0
+
+
+def test_severite_nan_partiel_nempeche_pas_detection():
+    """NaN sur certaines colonnes n'empêche pas de détecter une phase observée."""
+    nan = float("nan")
+    group = _make_group([{"Sol": nan, "Trans": nan, "Greg": 2.0}])
+    assert pipeline.compute_severite(group) == 3
+
+
+# ---------------------------------------------------------------------------
+# derive_binary
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("severite, expected", [
+    (0, 0),
+    (1, 1),
+    (2, 1),
+    (3, 1),
+])
+def test_derive_binary_scalaire(severite, expected):
+    assert pipeline.derive_binary(severite) == expected
+
+
+def test_derive_binary_na_reste_na():
+    assert pd.isna(pipeline.derive_binary(pd.NA))
+
+
+# ---------------------------------------------------------------------------
+# compute_intensite — optionnelle, non bloquante
+# ---------------------------------------------------------------------------
+
+def test_intensite_log1p_densite_moyenne():
+    group = _make_group([{"densite_imago": 99.0}, {"densite_imago": 199.0}])
+    assert pipeline.compute_intensite(group) == pytest.approx(math.log1p(149.0))
+
+
+def test_intensite_ignore_nan_partiel():
+    """La moyenne ignore les densités manquantes (ne bloque pas)."""
+    group = _make_group([{"densite_imago": float("nan")}, {"densite_imago": 9.0}])
+    assert pipeline.compute_intensite(group) == pytest.approx(math.log1p(9.0))
+
+
+def test_intensite_tout_nan_donne_nan():
+    """Densité absente partout (~35 % des cas) → NaN, jamais bloquant."""
+    group = _make_group([{"densite_imago": float("nan")}])
+    assert math.isnan(pipeline.compute_intensite(group))
+
+
+def test_intensite_densite_zero_donne_zero():
+    """log1p(0) = 0 : une densité nulle ne produit pas -inf."""
+    group = _make_group([{"densite_imago": 0.0}])
+    assert pipeline.compute_intensite(group) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# aggregate_per_cell — maille cellule 1 km × décade
+# ---------------------------------------------------------------------------
 
 def _make_survey_df(rows: list[dict]) -> pd.DataFrame:
-    """Construit un DataFrame de relevés minimal pour les tests aggregate_per_cell."""
-    defaults = {"rn_num": 1, "rn_nom": "RN1", "campagne_calc": "2010-2011",
-                "campagne_decade": 5, "Sol": 0.0, "Trans": 0.0, "Greg": 0.0}
-    return pd.DataFrame([{**defaults, **r} for r in rows]).assign(
-        rn_num=lambda df: df["rn_num"].astype("Int64")
-    )
+    """Relevés synthétiques pour aggregate_per_cell (clé cell_id × campagne × décade)."""
+    defaults = {
+        "cell_id": "100_200", "campagne_calc": "2010-2011", "campagne_decade": 5,
+        "densite_imago": float("nan"),
+        **{c: 0.0 for c in PHASE_COLS},
+    }
+    return pd.DataFrame([{**defaults, **r} for r in rows])
 
 
-# ---------------------------------------------------------------------------
-# compute_label — cas canoniques
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("tuples, expected", [
-    # Présence : au moins une ligne non nulle
-    ([(1, 0, 0), (0, 0, 0)], 1),
-    ([(0, 2, 0)],            1),
-    ([(0, 0, 3)],            1),
-    # Absence vérifiée : toutes les lignes à zéro
-    ([(0, 0, 0)],            0),
-    ([(0, 0, 0), (0, 0, 0)], 0),
-    # NaN traité comme 0 → ligne full-NaN ne génère pas de présence
-    ([(float("nan"), float("nan"), float("nan"))], 0),
-    # Présence malgré NaN partiel
-    ([(1.0, float("nan"), 0.0)], 1),
-])
-def test_compute_label(tuples, expected):
-    group = _make_group(*tuples)
-    assert pipeline.compute_label(group) == expected
-
-
-# ---------------------------------------------------------------------------
-# aggregate_per_cell — filtrage et effort
-# ---------------------------------------------------------------------------
-
-def test_aggregate_exclut_rn_num_na():
-    """Lignes avec rn_num=NA exclues même si Sol > 0 ; ne contaminent pas les voisines."""
+def test_aggregate_severite_max_sur_cellule_decade():
+    """Plusieurs relevés d'une même cellule × décade → sévérité = phase max."""
     df = _make_survey_df([
-        {"rn_num": pd.NA, "Sol": 10.0},  # doit être ignoré
-        {"rn_num": 1,     "Sol": 0.0},
-        {"rn_num": 1,     "Sol": 0.0},
+        {"Sol": 5.0},
+        {"Trans": 1.0},
+        {"Greg": 2.0},
     ])
     result = pipeline.aggregate_per_cell(df)
     assert len(result) == 1
-    assert result.iloc[0]["label"] == 0
-    assert result.iloc[0]["effort_prospection"] == 2
+    assert result.iloc[0]["severite"] == 3
 
 
-def test_aggregate_exclut_campagne_none():
-    """Lignes avec campagne_calc=None (inter-campagne) exclues."""
+def test_aggregate_une_ligne_par_cellule_decade():
+    """Deux cellules distinctes → deux lignes agrégées."""
     df = _make_survey_df([
-        {"campagne_calc": None,      "campagne_decade": pd.NA, "Sol": 5.0},
-        {"campagne_calc": "2010-2011", "campagne_decade": 5,  "Sol": 0.0},
+        {"cell_id": "1_1", "Sol": 1.0},
+        {"cell_id": "2_2", "Greg": 1.0},
+    ])
+    result = pipeline.aggregate_per_cell(df).set_index("cell_id")
+    assert result.loc["1_1", "severite"] == 1
+    assert result.loc["2_2", "severite"] == 3
+
+
+def test_aggregate_binaire_derive_present():
+    df = _make_survey_df([{"Trans": 1.0}])
+    row = pipeline.aggregate_per_cell(df).iloc[0]
+    assert row["severite"] == 2
+    assert row["binaire"] == 1
+
+
+def test_aggregate_binaire_zero_pour_absence():
+    df = _make_survey_df([{}])  # vraie absence
+    row = pipeline.aggregate_per_cell(df).iloc[0]
+    assert row["severite"] == 0
+    assert row["binaire"] == 0
+
+
+def test_aggregate_intensite_presente():
+    df = _make_survey_df([{"densite_imago": 9.0}])
+    row = pipeline.aggregate_per_cell(df).iloc[0]
+    assert row["intensite"] == pytest.approx(math.log1p(9.0))
+
+
+def test_aggregate_intensite_nan_ne_bloque_pas():
+    """Densité absente → intensite NaN mais la ligne est produite (sévérité OK)."""
+    df = _make_survey_df([{"Greg": 1.0}])  # densite_imago par défaut NaN
+    row = pipeline.aggregate_per_cell(df).iloc[0]
+    assert row["severite"] == 3
+    assert pd.isna(row["intensite"])
+
+
+def test_aggregate_effort_compte_lignes():
+    df = _make_survey_df([{"Sol": 0.0}, {"Sol": 1.0}, {"Sol": 0.0}])
+    row = pipeline.aggregate_per_cell(df).iloc[0]
+    assert row["effort_prospection"] == 3
+
+
+def test_aggregate_exclut_cell_id_manquant():
+    """Relevés sans rattachement spatial (cell_id NA) écartés."""
+    df = _make_survey_df([
+        {"cell_id": pd.NA, "Greg": 9.0},
+        {"cell_id": "1_1", "Sol": 0.0},
     ])
     result = pipeline.aggregate_per_cell(df)
     assert len(result) == 1
-    assert result.iloc[0]["label"] == 0
+    assert result.iloc[0]["cell_id"] == "1_1"
 
 
-def test_aggregate_effort_exact():
-    """effort_prospection = nombre exact de lignes (compte toutes les lignes du groupe)."""
+def test_aggregate_exclut_campagne_manquante():
+    """Relevés inter-campagne (campagne_calc None / décade NA) écartés."""
     df = _make_survey_df([
-        {"Sol": 0.0}, {"Sol": 1.0}, {"Sol": 0.0},
+        {"campagne_calc": None, "campagne_decade": pd.NA, "Greg": 9.0},
+        {"campagne_calc": "2010-2011", "campagne_decade": 5, "Sol": 0.0},
     ])
     result = pipeline.aggregate_per_cell(df)
-    assert result.iloc[0]["effort_prospection"] == 3
-    assert result.iloc[0]["label"] == 1
+    assert len(result) == 1
+    assert result.iloc[0]["severite"] == 0
 
 
-def test_aggregate_presence_une_ligne_parmi_plusieurs():
-    """Une seule ligne avec Greg > 0 suffit pour label=1."""
+def test_aggregate_conserve_annees_gregaires_precoces():
+    """Fenêtre 2001–2026 préservée : pas de coupe des campagnes grégaires précoces."""
     df = _make_survey_df([
-        {"Sol": 0.0, "Trans": 0.0, "Greg": 0.0},
-        {"Sol": 0.0, "Trans": 0.0, "Greg": 2.0},
-        {"Sol": 0.0, "Trans": 0.0, "Greg": 0.0},
+        {"campagne_calc": "2003-2004", "Greg": 1.0},
+        {"campagne_calc": "2007-2008", "Greg": 2.0},
     ])
     result = pipeline.aggregate_per_cell(df)
-    assert result.iloc[0]["label"] == 1
-
-
-# ---------------------------------------------------------------------------
-# build_full_grid — cellules masquées
-# ---------------------------------------------------------------------------
-
-def _make_rn_ref(rn_nums: list[int]) -> pd.DataFrame:
-    return pd.DataFrame({
-        "rn_num": pd.array(rn_nums, dtype="Int64"),
-        "rn_nom": [f"RN{n}" for n in rn_nums],
-    })
-
-
-def _make_observed(rn_nums: list[int], campagnes: list[str],
-                   decades: list[int], labels: list) -> pd.DataFrame:
-    return pd.DataFrame({
-        "rn_num": pd.array(rn_nums, dtype="Int64"),
-        "campagne_calc": campagnes,
-        "campagne_decade": decades,
-        "label": pd.array(labels, dtype="Int64"),
-        "effort_prospection": [1] * len(rn_nums),
-    })
-
-
-def test_build_full_grid_cellules_masquees():
-    """Régions non prospectées → label=NA, effort=0."""
-    rn_ref = _make_rn_ref([1, 2, 3])
-    observed = _make_observed([1], ["2010-2011"], [5], [1])
-
-    result = pipeline.build_full_grid(observed, rn_ref)
-    assert len(result) == 3  # 3 régions × 1 (campagne, décade)
-
-    rn1 = result[result["rn_num"] == 1].iloc[0]
-    assert rn1["label"] == 1
-    assert rn1["effort_prospection"] == 1
-
-    for rn in [2, 3]:
-        row = result[result["rn_num"] == rn].iloc[0]
-        assert pd.isna(row["label"]), f"rn_num={rn} devrait avoir label=NA"
-        assert row["effort_prospection"] == 0
-
-
-def test_build_full_grid_rn_nom_pour_masques():
-    """rn_nom est présent même pour les cellules masquées."""
-    rn_ref = _make_rn_ref([99])
-    observed = _make_observed([1], ["2010-2011"], [1], [0])
-
-    # rn_ref contient uniquement rn_num=99 (non présente dans observed)
-    result = pipeline.build_full_grid(observed, rn_ref)
-    row = result[result["rn_num"] == 99].iloc[0]
-    assert row["rn_nom"] == "RN99"
-    assert pd.isna(row["label"])
-
-
-def test_build_full_grid_taille():
-    """Grille = len(rn_ref) × len(décades uniques dans observed)."""
-    rn_ref = _make_rn_ref([1, 2, 3, 4, 5])
-    observed = _make_observed(
-        [1, 1, 2],
-        ["2010-2011", "2010-2011", "2011-2012"],
-        [5, 10, 5],
-        [1, 0, 1],
-    )
-    result = pipeline.build_full_grid(observed, rn_ref)
-    # 3 décades uniques : (2010-2011, 5), (2010-2011, 10), (2011-2012, 5)
-    assert len(result) == 5 * 3
-
-
-# ---------------------------------------------------------------------------
-# apply_exclusions
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("campagne, label_initial, expect_na", [
-    ("2023-2024", 1, True),
-    ("2023-2024", 0, True),
-    ("2010-2011", 1, False),
-    ("2001-2002", 0, False),
-])
-def test_apply_exclusions_label(campagne, label_initial, expect_na):
-    df = pd.DataFrame({
-        "campagne_calc": [campagne],
-        "label": pd.array([label_initial], dtype="Int64"),
-        "effort_prospection": [3],
-    })
-    result = pipeline.apply_exclusions(df)
-    if expect_na:
-        assert pd.isna(result.iloc[0]["label"])
-    else:
-        assert result.iloc[0]["label"] == label_initial
-
-
-def test_apply_exclusions_conserve_effort():
-    """apply_exclusions ne modifie pas effort_prospection."""
-    df = pd.DataFrame({
-        "campagne_calc": ["2023-2024"],
-        "label": pd.array([1], dtype="Int64"),
-        "effort_prospection": [7],
-    })
-    result = pipeline.apply_exclusions(df)
-    assert result.iloc[0]["effort_prospection"] == 7
-
-
-def test_apply_exclusions_ne_modifie_pas_original():
-    """apply_exclusions opère sur une copie (pas de mutation en place)."""
-    df = pd.DataFrame({
-        "campagne_calc": ["2023-2024"],
-        "label": pd.array([1], dtype="Int64"),
-        "effort_prospection": [1],
-    })
-    pipeline.apply_exclusions(df)
-    assert df.iloc[0]["label"] == 1
+    campagnes = set(result["campagne_calc"])
+    assert {"2003-2004", "2007-2008"} <= campagnes
 
 
 # ---------------------------------------------------------------------------
@@ -228,60 +250,33 @@ def df_labels():
 
 
 def test_colonnes_presentes(df_labels):
-    required = {"rn_num", "rn_nom", "campagne_calc", "campagne_decade",
-                "effort_prospection", "label"}
+    required = {"cell_id", "campagne_calc", "campagne_decade",
+                "severite", "binaire", "intensite", "effort_prospection"}
     assert required <= set(df_labels.columns), (
         f"Colonnes manquantes : {required - set(df_labels.columns)}"
     )
 
 
-def test_label_valeurs_valides(df_labels):
-    """label est uniquement 0, 1 ou NA."""
-    valeurs = set(df_labels["label"].dropna().unique())
-    assert valeurs <= {0, 1}, f"Valeurs inattendues dans label : {valeurs - {0, 1}}"
+def test_severite_valeurs_valides(df_labels):
+    """severite est uniquement 0, 1, 2, 3 ou NA."""
+    valeurs = set(df_labels["severite"].dropna().unique())
+    assert valeurs <= {0, 1, 2, 3}, f"Valeurs inattendues : {valeurs - {0, 1, 2, 3}}"
 
 
-def test_sans_effort_implique_masque(df_labels):
-    """Toute cellule avec effort_prospection=0 doit avoir label=NA."""
-    zero_effort = df_labels[df_labels["effort_prospection"] == 0]
-    assert zero_effort["label"].isna().all(), (
-        "Des cellules sans prospection ont un label non-NA"
-    )
+def test_binaire_coherent_avec_severite(df_labels):
+    """binaire == 1 ssi severite >= 1 (sur les lignes labellisées)."""
+    labelled = df_labels[df_labels["severite"].notna()]
+    attendu = (labelled["severite"] >= 1).astype("Int64")
+    assert (labelled["binaire"] == attendu).all()
 
 
-def test_avec_effort_implique_label_ou_exclusion(df_labels):
-    """Toute cellule prospectée (effort >= 1) a label non-NA OU est une campagne exclue."""
-    with_effort = df_labels[df_labels["effort_prospection"] >= 1]
-    unlabeled = with_effort[with_effort["label"].isna()]
-    assert unlabeled["campagne_calc"].isin(pipeline._EXCLUDED_CAMPAIGNS).all(), (
-        "Des cellules prospectées ont label=NA hors campagnes exclues"
-    )
+def test_fenetre_2001_2026_annees_gregaires_precoces(df_labels):
+    """Les campagnes grégaires précoces (2004/2007/2008) sont conservées."""
+    campagnes = set(df_labels["campagne_calc"].dropna())
+    for camp in ("2003-2004", "2007-2008"):
+        assert camp in campagnes, f"Campagne précoce {camp} absente de la fenêtre"
 
 
-def test_90_regions_presentes(df_labels):
-    """Les 90 régions naturelles sont représentées dans la grille."""
-    n = df_labels["rn_num"].nunique()
-    assert n == 90, f"Nombre de régions naturelles : {n} (attendu 90)"
-
-
-def test_campagne_decade_plage(df_labels):
-    """campagne_decade est dans [1, 30]."""
-    assert df_labels["campagne_decade"].between(1, 30).all(), (
-        "Des valeurs de campagne_decade hors [1, 30] trouvées"
-    )
-
-
-def test_campagnes_exclues_toutes_na(df_labels):
-    """Les campagnes exclues ont exclusivement label=NA."""
-    for camp in pipeline._EXCLUDED_CAMPAIGNS:
-        subset = df_labels[df_labels["campagne_calc"] == camp]
-        if len(subset) == 0:
-            continue
-        assert subset["label"].isna().all(), (
-            f"Campagne exclue {camp!r} a des labels non-NA"
-        )
-
-
-def test_rn_nom_jamais_vide(df_labels):
-    """rn_nom est renseigné pour toutes les lignes, y compris les cellules masquées."""
-    assert df_labels["rn_nom"].notna().all(), "Des lignes ont rn_nom manquant"
+def test_effort_toujours_positif(df_labels):
+    """Chaque cellule × décade émise correspond à au moins un relevé."""
+    assert (df_labels["effort_prospection"] >= 1).all()

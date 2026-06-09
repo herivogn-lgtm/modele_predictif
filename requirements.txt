@@ -1,0 +1,25 @@
+# Dépendances du projet modele_predictif
+# Versions figées sur l'environnement de référence (.venv, Python 3.14).
+# Installation : pip install -r requirements.txt
+
+# ── Données & I/O ─────────────────────────────────────────────────────────────
+pandas==3.0.3
+numpy==2.4.6
+pyarrow==24.0.0            # moteur Parquet (read_parquet / to_parquet)
+xlrd==2.0.2               # lecture du .xls historique (format BIFF8)
+requests==2.34.2          # téléchargement ENSO/ONI (NOAA)
+
+# ── Géospatial ────────────────────────────────────────────────────────────────
+geopandas==1.1.3          # tire shapely + pyproj en dépendances
+
+# ── Earth Engine (pipeline #04) ───────────────────────────────────────────────
+earthengine-api==1.7.29
+
+# ── Modélisation (pipelines #07/#08/#11) ──────────────────────────────────────
+scikit-learn>=1.5         # non installé dans le venv de référence ; requis par lgbm_baseline_07
+lightgbm==4.6.0
+joblib==1.5.3
+neuralprophet==0.4.2      # tire torch en dépendance
+
+# ── Développement / tests ─────────────────────────────────────────────────────
+pytest==9.0.3

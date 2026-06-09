@@ -1,154 +1,91 @@
-# Pipeline #09 — Sorties opérationnelles niveau de risque 0–4
+# Pipeline #09 — Sorties opérationnelles : carte de sévérité 0–3 à 1 km
 
-**Script** : `src/sorties_operationnelles_09.py`  
-**Entrées** : Sorties de #06, #07, #08 + shapefiles  
-**Sorties** : `09_rn_risque_decade.parquet` + 6 fichiers CSV/GeoJSON  
-**Durée estimée** : < 5 minutes  
-**Dépendances obligatoires** : Pipelines [#06](06-table-entrainement.md), [#07](07-lgbm-baseline.md), [#08](08-lgbm-hierarchique.md)
+**Script** : `src/sorties_operationnelles_09.py`
+**Entrées** : `06_table_entrainement_unifiee.parquet`, `07_modele_retenu.txt`, `01_grille_1km.parquet`
+**Sorties** : CSV décade/mois/aire + GeoJSON + GeoTIFF + PNG
+**Durée estimée** : < 5 minutes (campagne T+1)
+**Dépendances obligatoires** : Pipelines [#06](06-table-entrainement.md), [#07](07-benchmark-ordinal.md)
+
+> **HITL** : un humain valide le modèle retenu via le rapport ([#10](10-rapport-performance.md)) **avant** de générer les cartes destinées au terrain.
 
 ---
 
 ## Objectif
 
-Chaîner les trois modèles LightGBM (présence, densité, phase) sur l'ensemble des lignes de la table unifiée, calculer le niveau de risque acridien 0–4 par région naturelle × décade, puis agréger vers les 12 secteurs de l'aire grégarigène et exporter les résultats aux trois horizons temporels (décadaire, mensuel, saisonnier) en format CSV et GeoJSON géoréférencés.
+Restituer les prédictions de **sévérité-phase ordinale 0–3** pour la **décade T+1** sur la grille **1 km** de l'aire grégarigène, en support à la prospection :
+
+- **Carte de sévérité 0–3 à 1 km** (alerte précoce, décade à venir).
+- **Agrégat mensuel par aire complémentaire** AMI/ATM/AD/AGT (`AIRE_CODE`, planification).
+- **Binaire dérivé** (probabilité de présence, sév ≥ 1) pour comparaison AUC à la littérature.
+- Export **PNG** + **SIG** (GeoJSON vectoriel + GeoTIFF raster) pour les supports terrain.
+
+L'outil oriente les prospections vers les cellules à sévérité **2–3** et signale les passages au niveau 3 (grégaire) en T+1.
+
+> Refonte vs l'ancien pipeline : abandon du **niveau de risque 0–4 / Annexe 8** et de l'agrégation par régions naturelles → secteurs. La cible est désormais la **sévérité ordinale 0–3** prédite par le modèle retenu (#07), restituée à la maille **cellule 1 km**.
 
 ---
 
 ## Entrées
 
-| Fichier | Usage |
-|---------|-------|
-| `data/processed/06_table_entrainement_unifiee.parquet` | Features pour toutes les cellules (toutes campagnes) |
-| `data/processed/07_lgbm_model.pkl` | Modèle de présence/absence |
-| `data/processed/07_rapport_walk_forward.csv` | Seuil de présence (ligne GLOBAL, colonne `threshold`) |
-| `data/processed/08_lgbm_densite.pkl` | Modèle de régression densité |
-| `data/processed/08_lgbm_phase.pkl` | Modèle de classification phase |
-| `data/processed/08_rapport_walk_forward.csv` | Seuil G (ligne GLOBAL, colonne `threshold_G`) |
-| `data/aire_gregarigene/aire_gregarigene.shp` | 12 secteurs (projection UTM 38S pour la jointure spatiale) |
-| `data/region_naturelle/region_naturelle.shp` | 90 régions naturelles |
+| Fichier | Rôle |
+|---------|------|
+| `data/processed/06_table_entrainement_unifiee.parquet` | Historique observé (entraînement) + surface `a_predire` |
+| `data/processed/07_modele_retenu.txt` | Nom du modèle retenu (#07) ré-entraîné ici |
+| `data/processed/01_grille_1km.parquet` | Polygones cellule 1 km (EPSG:32738) pour les exports spatiaux |
 
 ---
 
 ## Sorties
 
-| Fichier | Description | Lignes approx. |
-|---------|-------------|----------------|
-| `data/processed/09_rn_risque_decade.parquet` | Risque par région naturelle × décade (intermédiaire) | 90 × N décades |
-| `data/processed/09_sorties_decadaire.csv` | Risque par secteur × décade | 12 × N décades |
-| `data/processed/09_sorties_mensuelle.csv` | Risque par secteur × mois de campagne | 12 × N mois |
-| `data/processed/09_sorties_saisonniere.csv` | Risque par secteur × campagne | 12 × N campagnes |
-| `data/processed/09_sorties_decadaire.geojson` | Version géoréférencée décadaire | idem CSV |
-| `data/processed/09_sorties_mensuelle.geojson` | Version géoréférencée mensuelle | idem CSV |
-| `data/processed/09_sorties_saisonniere.geojson` | Version géoréférencée saisonnière | idem CSV |
-
-### Schéma de `09_rn_risque_decade.parquet`
-
-| Colonne | Type | Description |
-|---------|------|-------------|
-| `rn_num`, `rn_nom` | int/str | Identifiant région naturelle |
-| `campagne_calc` | str | Campagne `"YYYY-YYYY+1"` |
-| `campagne_decade` | int | Décade dans la campagne (1–30) |
-| `presence_pred` | int (0/1) | Présence prédite |
-| `densite_pred` | float ou NaN | Densité prédite si présence=1 |
-| `phase_pred` | str ou None | Phase prédite si présence=1 |
-| `potentiel_predit` | int (0–5) | Potentiel acridien calculé par Annexe 8 |
-| `niveau_risque` | int (0–4) | Potentiel plafonné à 4 |
-| `effort_bas` | bool | True si effort_prospection ≤ 1 |
-
-### Schéma des sorties décadaires/mensuelles/saisonnières (CSV + GeoJSON)
-
-| Colonne | Description |
-|---------|-------------|
-| `SECT_NO`, `SECT_NOM` | Identifiants du secteur |
-| `AIRE_CODE`, `AIRE_NOM` | Acrido-région |
-| `campagne_calc` | Campagne |
-| `campagne_decade` (décadaire) / `mois_campagne` (mensuel) | Période |
-| `niveau_risque_max` | Maximum des niveaux de risque des régions du secteur |
-| `phase_dominante` | Mode des phases prédites non-None dans le secteur |
-| `n_regions` | Nombre de régions naturelles dans le secteur |
-| `n_regions_risque_eleve` | Nombre de régions avec niveau_risque ≥ 3 |
-| `n_regions_effort_bas` | Nombre de régions avec effort_bas = True |
-| `faible_couverture` | True si majorité des régions avec effort_bas = True |
-| `risque_eleve` | 1 si niveau_risque_max ≥ 3, sinon 0 |
-| `geometry` (GeoJSON) | Géométrie du secteur (EPSG:4326) |
+| Fichier | Contenu |
+|---------|---------|
+| `09_carte_severite_decade.csv` | Sévérité 0–3 + proba présence par cellule × décade (campagne T+1) |
+| `09_carte_severite_mensuelle.csv` | Sévérité agrégée au mois (phase max) par cellule |
+| `09_agregat_aire_mensuel.csv` | Agrégat mensuel par `AIRE_CODE` (sév max, n cellules, n cellules-foyer) |
+| `09_carte_severite.geojson` | Carte 1 km vectorielle (sévérité par cellule) |
+| `09_carte_severite.tif` | Carte 1 km rasterisée (GeoTIFF, 1 km, nodata 255) |
+| `09_carte_severite.png` | Rendu cartographique : cellules 0–3 **superposées sur les couches locales** `region_naturelle` (fond) + `aire_gregarigene` (contour des secteurs), semi-transparentes ; vue cadrée sur l'emprise des cellules. Aucune tuile web. |
 
 ---
 
-## Règles métier
+## Fonctions pures (testées — `tests/test_09_sorties_operationnelles.py`)
 
-### RM-1 : Chaîne d'inférence hiérarchique
+| Fonction | Rôle |
+|----------|------|
+| `derive_binary(severite)` | Binaire présence dérivé = (sévérité ≥ 1) |
+| `to_severity_map(carte_decade)` | Agrégation décade → mois ; sévérité mensuelle = **phase max** ; conserve `cell_id` / `AIRE_CODE` |
+| `aggregate_by_aire(carte_mois)` | Agrégat mensuel par `AIRE_CODE` : `{severite_max, n_cellules, n_cellules_foyer (sév ≥ 2)}` |
+| `to_cell_map(carte_decade)` | Variante « pire cas » : réduit la carte décadaire à 1 valeur/cellule (phase max sur la campagne). La carte par défaut utilise plutôt **une décade unique** (`--decade`) pour éviter la saturation. |
 
-Pour chaque cellule (région × décade) :
+`mois_campagne = (campagne_decade − 1) // 3 + 1` (3 décades par mois).
 
-```
-Étape 1 : presence_pred = (P(présence) ≥ threshold_pres)
-
-Si presence_pred == 0 :
-    densite_pred  = NaN
-    phase_pred    = None
-    potentiel_predit = 0
-
-Si presence_pred == 1 :
-    Étape 2 : densite_pred = model_densite.predict(X)
-    Étape 3 : phase_pred   = _apply_threshold_G(model_phase.predict_proba(X), threshold_G)
-    potentiel_predit = Annexe 8[phase_pred, classe_densite(densite_pred)]
-```
-
-Les seuils `threshold_pres` et `threshold_G` sont lus depuis la ligne `GLOBAL` des rapports #07 et #08.
-
-### RM-2 : Calcul du niveau de risque
-
-```
-niveau_risque = min(potentiel_predit, 4)
-```
-
-Le potentiel acridien Annexe 8 peut atteindre 5 (phase G + densité très élevée). Il est plafonné à 4 pour s'aligner avec l'échelle opérationnelle du SIG-LMC (0–4).
-
-### RM-3 : Agrégation vers les secteurs
-
-| Métrique de sortie | Règle d'agrégation |
-|--------------------|-------------------|
-| `niveau_risque_max` | Maximum des `niveau_risque` des régions du secteur |
-| `phase_dominante` | Mode des `phase_pred` non-None dans le secteur |
-| `n_regions_risque_eleve` | Compte des régions avec `niveau_risque ≥ 3` |
-| `faible_couverture` | True si `n_regions_effort_bas > n_regions / 2` |
-
-### RM-4 : Flag effort_bas
-
-`effort_bas = True` pour une région × décade si `effort_prospection ≤ 1` (constante `SEUIL_EFFORT_BAS = 1`). Ce flag signale que la prédiction de risque dans cette région est basée sur peu ou pas d'observations terrain directes — le modèle extrapole à partir des features environnementales.
-
-### RM-5 : Agrégation horizon mensuel
-
-`mois_campagne = (campagne_decade - 1) // 3 + 1` (octobre = mois 1, juillet = mois 10). L'agrégation mensuelle groupe les 3 décades consécutives et prend le maximum de `niveau_risque` sur les 3 décades.
-
-### RM-6 : Jointure spatiale régions → secteurs
-
-La jointure utilise la projection UTM 38S (EPSG:32738) pour le calcul des surfaces. En cas de chevauchement d'une région naturelle sur plusieurs secteurs, le secteur avec la **plus grande surface d'intersection** est retenu.
+L'orchestration `run()` (non testée) entraîne le modèle retenu sur l'historique observé, prédit la **dernière campagne** (décade T+1), et réutilise `_predit_fold` / `_lire_modele_retenu` (#10) et `build_models` / `get_feature_columns` (#07) — sans nouveau seam.
 
 ---
 
-## Exécution
+## Lancement
 
 ```bash
-python src/sorties_operationnelles_09.py
+./.venv/bin/python src/sorties_operationnelles_09.py
+
+# Choisir l'algorithme, la campagne et la décade en ligne de commande :
+./.venv/bin/python src/sorties_operationnelles_09.py --modele catboost --campagne 2025-2026 --decade 19
+./.venv/bin/python src/sorties_operationnelles_09.py -h   # aide
 ```
 
----
+| Argument CLI | Env équivalent | Défaut |
+|--------------|----------------|--------|
+| `--modele {regression_ordinale,random_forest,lightgbm,xgboost,catboost,lstm}` | `SORTIES_MODELE` | modèle retenu `07_modele_retenu.txt` |
+| `--campagne YYYY-YYYY` | `SORTIES_CAMPAGNE` | dernière campagne couverte (NDVI ≥ `MIN_COUVERTURE_FEATURES`, défaut 50 %) |
+| `--decade N` (1–36) | `SORTIES_DECADE` | dernière décade de la campagne |
 
-## Dépendances
+- **Carte spatiale = une seule décade** (la « décade T+1 »), **pas** le max sur la campagne — sinon chaque cellule atteint son pire niveau sur la saison et la carte sature en grégaire. Le run affiche les *décades à forte variété spatiale* pour aider au choix de `--decade`.
+- **Campagne cible** : la toute dernière campagne du calendrier peut être un **futur non encore extrait par GEE** (features 100 % NaN → carte plate) ; elle est automatiquement ignorée.
 
-- **Amont** :
-  - [#06](06-table-entrainement.md) — features
-  - [#07](07-lgbm-baseline.md) — modèle + seuil présence
-  - [#08](08-lgbm-hierarchique.md) — modèles densité + phase + seuil G
-  - Shapefiles `data/aire_gregarigene/` et `data/region_naturelle/`
-- **Aval** : [#10](10-rapport-performance.md) — charge `09_rn_risque_decade.parquet`
-- **Bibliothèques** : `lightgbm`, `geopandas`, `pandas`, `joblib`, `pyarrow`
+> ⚠️ Un vrai forecast de la campagne future (ex. 2026-2027) nécessite d'abord d'**extraire ses covariables GEE** ([#04](04-extraction-gee.md)). Sans cela, seules les campagnes déjà couvertes produisent une carte exploitable.
 
 ---
 
 ## Avertissements
 
-Les sorties couvrent **toutes les campagnes** (train, validation, inference). Pour un usage opérationnel, filtrer sur les campagnes récentes via la colonne `campagne_calc`.
-
-Un secteur avec `faible_couverture = True` et `niveau_risque_max = 0` doit être interprété avec précaution : le risque faible prédit pourrait être dû à un manque de prospections terrain plutôt qu'à une véritable absence de criquets. Le guide d'interprétation [guide-interpretation-risque.md](../guide-interpretation-risque.md) recommande d'ajouter +1 niveau de précaution dans ce cas.
+La **qualité** de la carte dépend du modèle retenu. Si le modèle retenu est la régression ordinale linéaire (carte plate, peu de relief), c'est cohérent avec son QWK / gain-lift modestes (#10) — relancer après un run complet de référence #07 qui retiendrait un modèle plus expressif (arbres / CatBoost). La validation humaine HITL via le rapport #10 reste obligatoire avant diffusion terrain.

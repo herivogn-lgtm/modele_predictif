@@ -60,3 +60,6 @@ tmp/
 # PyTorch / NeuralProphet artefacts
 lightning_logs/
 *.ckpt
+
+# Artefacts CatBoost (régénérés à chaque entraînement)
+catboost_info/

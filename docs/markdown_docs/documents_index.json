@@ -1,0 +1,152 @@
+{
+  "documents": [
+    {
+      "name": "Nicolas_RANDRIANARIJAONA_Thèse_20260124",
+      "sections": 38,
+      "characters": 45091,
+      "words": 5972,
+      "keywords": {
+        "criquet": 26,
+        "grégaire": 2,
+        "solitaire": 2,
+        "pullulation": 6,
+        "essaim": 4,
+        "grégarisation": 4,
+        "surveillance": 33,
+        "lutte": 35,
+        "prévention": 4,
+        "NDVI": 8,
+        "télédétection": 11,
+        "Madagascar": 52,
+        "climat": 12
+      }
+    },
+    {
+      "name": "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)",
+      "sections": 322,
+      "characters": 584545,
+      "words": 81398,
+      "keywords": {
+        "criquet": 502,
+        "locuste": 124,
+        "grégaire": 177,
+        "solitaire": 178,
+        "pullulation": 47,
+        "essaim": 73,
+        "grégarisation": 89,
+        "migration": 35,
+        "surveillance": 61,
+        "lutte": 287,
+        "prévention": 1,
+        "télédétection": 1,
+        "Madagascar": 128,
+        "climat": 21
+      }
+    }
+  ],
+  "total_sections": 360,
+  "keywords": {
+    "criquet": {
+      "total": 528,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 26,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 502
+      }
+    },
+    "grégaire": {
+      "total": 179,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 2,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 177
+      }
+    },
+    "solitaire": {
+      "total": 180,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 2,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 178
+      }
+    },
+    "pullulation": {
+      "total": 53,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 6,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 47
+      }
+    },
+    "essaim": {
+      "total": 77,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 4,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 73
+      }
+    },
+    "grégarisation": {
+      "total": 93,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 4,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 89
+      }
+    },
+    "surveillance": {
+      "total": 94,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 33,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 61
+      }
+    },
+    "lutte": {
+      "total": 322,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 35,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 287
+      }
+    },
+    "prévention": {
+      "total": 5,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 4,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 1
+      }
+    },
+    "NDVI": {
+      "total": 8,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 8
+      }
+    },
+    "télédétection": {
+      "total": 12,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 11,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 1
+      }
+    },
+    "Madagascar": {
+      "total": 180,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 52,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 128
+      }
+    },
+    "climat": {
+      "total": 33,
+      "documents": {
+        "Nicolas_RANDRIANARIJAONA_Thèse_20260124": 12,
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 21
+      }
+    },
+    "locuste": {
+      "total": 124,
+      "documents": {
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 124
+      }
+    },
+    "migration": {
+      "total": 35,
+      "documents": {
+        "MANUEL_DE_LUTTE_PRÉVENTIVE_(VF)": 35
+      }
+    }
+  }
+}

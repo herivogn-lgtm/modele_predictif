@@ -194,7 +194,13 @@ def df_06():
         pytest.skip(
             "Parquet #06 absent — lancer d'abord : python src/table_entrainement_06.py"
         )
-    return pd.read_parquet(PARQUET_06)
+    df = pd.read_parquet(PARQUET_06)
+    if "split" not in df.columns:
+        pytest.skip(
+            "Colonne 'split' absente — le découpage walk-forward relève de l'issue #06 "
+            "(walk_forward_split), pas encore livré"
+        )
+    return df
 
 
 @pytest.fixture(scope="module")
