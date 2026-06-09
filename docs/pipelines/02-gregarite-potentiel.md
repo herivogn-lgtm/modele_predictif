@@ -98,15 +98,11 @@ python src/gregarite_potentiel_02.py
 
 - **Amont** : [#01](01-nettoyage-jointure.md) — `01_releves_nettoyes.parquet`
 - **Aval** :
-  - [#03](03-labels-entrainement.md) — consomme `Sol`, `Trans`, `Greg` pour les labels
-  - [#06](06-table-entrainement.md) — consomme `niveau_gregarite_dominant`, `potentiel_acridien_dominant` comme features
-  - [#08](08-lgbm-hierarchique.md) — consomme `densite_imago` pour la cible régression
+  - [#03](03-labels-entrainement.md) — consomme `Sol`, `Trans`, `Greg` pour la sévérité ordinale et `densite_imago` pour l'intensité optionnelle
 - **Bibliothèques** : `pandas`, `numpy`, `pyarrow`
 
 ---
 
 ## Avertissements
 
-Le potentiel acridien calculé ici (RM-3) est un indicateur **observé** au niveau du relevé individuel. Il ne doit pas être confondu avec le potentiel acridien **prédit** calculé en [#09](09-sorties-operationnelles.md) à partir des prédictions de phase et de densité des modèles ML.
-
-L'agrégation du niveau de grégarité et du potentiel acridien par région × décade (mode dominant) est effectuée ultérieurement en [#06](06-table-entrainement.md), pas dans ce pipeline.
+Le potentiel acridien (RM-3) et la densité (RM-2) sont des indicateurs **observés** au niveau du relevé. Dans l'architecture OS3 actuelle ([ADR 0001](../adr/0001-cible-ordinale-severite-phase.md)), la cible du modèle est la **sévérité-phase ordinale 0–3** dérivée des comptages (#03), pas le potentiel acridien 0–5 de l'Annexe 8 — cette échelle 0–6 / 0–5 a été abandonnée du périmètre de modélisation. Le `niveau_gregarite` et `densite_imago` restent calculés ici car ils alimentent la sévérité (#03) et l'intensité optionnelle.

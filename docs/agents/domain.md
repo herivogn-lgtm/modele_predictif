@@ -18,8 +18,8 @@ Single-context repo:
 ├── CONTEXT.md
 ├── docs/
 │   ├── adr/
-│   │   ├── 0001-architecture-double-sortie.md
-│   │   └── 0002-contrainte-cpu-uniquement.md
+│   │   ├── 0001-cible-ordinale-severite-phase.md
+│   │   └── 0002-forecast-decade-t-plus-1.md  (… 0003–0005)
 │   └── agents/         ← this directory
 └── data/
 ```
