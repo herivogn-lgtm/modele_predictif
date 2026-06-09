@@ -63,7 +63,14 @@ La **sortie opérationnelle** est le niveau de risque acridien 0–4 par polygon
 | `region_naturelle/` | 90 polygones — unité spatiale de modélisation |
 | `2001_2026_Acrido_vf.xls` | Relevés terrain 2001–2026 (lacunes 2023–2024) |
 
-**Variables environnementales** extraites via Google Earth Engine : pluviométrie, humidité des sols, température, occupation du sol / couverture végétale.
+**Variables environnementales** : 24 prédicteurs issus de 4 sources principales :
+- ☔ **CHIRPS** (7 variables) : pluviométrie + POP (Plage d'Optimum Pluviométrique 50-125 mm/mois)
+- 🌱 **MODIS** (6 variables) : NDVI/EVI (végétation)
+- 🌡️ **MODIS LST** (3 variables) : température de surface
+- 🦗 **Relevés terrain** (4 variables) : historique acridien (sévérité, densité)
+- 📍 **Métadonnées** (4 variables) : spatial/temporel (aires, saisonnalité)
+
+**Voir** : [`docs/VARIABLES-REFERENCE-RAPIDE.md`](docs/VARIABLES-REFERENCE-RAPIDE.md) pour la liste complète et [`docs/INDEX.md`](docs/INDEX.md) pour naviguer dans la documentation.
 
 ## Installation
 

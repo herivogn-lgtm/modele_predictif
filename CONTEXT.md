@@ -21,9 +21,9 @@ _Avoid_ : criquet, locuste, acridien (trop génériques)
 **Aire grégarigène** :
 Zone d'étude du modèle = **toute** l'aire grégarigène du Criquet migrateur malgache,
 délimitée par le shapefile `data/aire_gregarigene/` : **12 polygones / 12 secteurs**
-regroupés en **4 aires complémentaires**, ≈ 181 414 ha (~1 814 km²), Sud / Sud-Ouest
+regroupés en **4 aires complémentaires**, ≈ **181 414 km²**, Sud / Sud-Ouest
 (lat −25,6 à −20,0 ; lon 43,2 à 47,4), polygones **fragmentés**. C'est l'emprise de
-modélisation (grille 1 km **à l'intérieur des polygones** uniquement, ~1 800 cellules).
+modélisation (grille 1 km **à l'intérieur des polygones** uniquement, **~181 413 cellules**).
 **Clip strict** : entraînement et prédiction partagent cette emprise ; les relevés
 hors polygones (16 %) sont écartés. Voir [ADR 0003](docs/adr/0003-emprise-aire-gregarigene-clip-strict.md).
 _Avoid_ : zone d'étude, habitat, « Sud-Ouest seul » (la thèse §31 restreignait, pas nous)

@@ -93,6 +93,115 @@ def campaign_label(year: int, month: int) -> str | None:
     return None
 
 
+def parse_month_to_decades(month_str: str, buffer: int = 2) -> tuple[int, int, int, int]:
+    """Parse --month YYYY-MM en plage de décades (year_start, decade_start, year_end, decade_end).
+    
+    Args:
+        month_str: Format "YYYY-MM" (ex: "2026-06")
+        buffer: Nombre de décades avant le mois à inclure (pour lags)
+    
+    Returns:
+        (year_start, decade_start, year_end, decade_end) pour la plage calendaire
+    
+    Exemple:
+        parse_month_to_decades("2026-06", buffer=2)
+        → (2026, 14, 2026, 18)  # Mai D2-D3 + Juin D1-D3
+    """
+    try:
+        year, month = map(int, month_str.split("-"))
+    except ValueError:
+        raise ValueError(f"Format --month invalide : {month_str!r} (attendu YYYY-MM)")
+    
+    if not (1 <= month <= 12):
+        raise ValueError(f"Mois invalide : {month} (attendu 1-12)")
+    
+    # Décades du mois demandé (calendaire : 3 décades/mois)
+    decade_end = month * 3
+    decade_start = decade_end - 2
+    
+    # Appliquer le buffer
+    decade_start -= buffer
+    
+    # Gérer le débordement d'année
+    year_start = year
+    if decade_start < 1:
+        year_start -= 1
+        decade_start += 36
+    
+    return year_start, decade_start, year, decade_end
+
+
+def parse_decades_range(decades_str: str) -> tuple[int, int, int, int]:
+    """Parse --decades YYYY-DD:YYYY-DD en plage (year_start, decade_start, year_end, decade_end).
+    
+    Args:
+        decades_str: Format "YYYY-DD:YYYY-DD" (ex: "2026-14:2026-18")
+    
+    Returns:
+        (year_start, decade_start, year_end, decade_end)
+    
+    Exemple:
+        parse_decades_range("2026-14:2026-18")
+        → (2026, 14, 2026, 18)
+    """
+    try:
+        start_str, end_str = decades_str.split(":")
+        year_start, decade_start = map(int, start_str.split("-"))
+        year_end, decade_end = map(int, end_str.split("-"))
+    except ValueError:
+        raise ValueError(f"Format --decades invalide : {decades_str!r} (attendu YYYY-DD:YYYY-DD)")
+    
+    if not (1 <= decade_start <= 36 and 1 <= decade_end <= 36):
+        raise ValueError(f"Décades invalides : {decade_start}, {decade_end} (attendu 1-36)")
+    
+    return year_start, decade_start, year_end, decade_end
+
+
+def build_decade_calendar_range(year_start: int, decade_start: int, 
+                                  year_end: int, decade_end: int) -> pd.DataFrame:
+    """Génère les décades dans une plage spécifique (year, decade_num).
+    
+    Args:
+        year_start, decade_start: Première décade (calendaire 1-36)
+        year_end, decade_end: Dernière décade (calendaire 1-36, inclusive)
+    
+    Returns:
+        DataFrame avec les décades dans la plage, format identique à build_decade_calendar()
+    """
+    records = []
+    
+    # Convertir decade_num calendaire (1-36) en (month, part)
+    for year in range(year_start, year_end + 1):
+        start_dec = decade_start if year == year_start else 1
+        end_dec = decade_end if year == year_end else 36
+        
+        for decade_num in range(start_dec, end_dec + 1):
+            # Décade calendaire → (mois civil, partie)
+            month = ((decade_num - 1) // 3) + 1
+            part = ((decade_num - 1) % 3) + 1
+            
+            d_start, d_end = decade_bounds(year, month, part)
+            campaign = campaign_label(year, month)
+            
+            records.append({
+                "year": year,
+                "month": month,
+                "decade_part": part,
+                "date_start": d_start,
+                "date_end": d_end,
+                "midpoint": d_start + timedelta(days=(d_end - d_start).days // 2),
+                "campaign": campaign,
+                "decade_num": decade_num,
+                "decade_id": year * 100 + decade_num,
+            })
+    
+    df = pd.DataFrame(records)
+    df["date_start"] = pd.to_datetime(df["date_start"])
+    df["date_end"] = pd.to_datetime(df["date_end"])
+    df["midpoint"] = pd.to_datetime(df["midpoint"])
+    return df
+
+
 def build_decade_calendar(years: list[int]) -> pd.DataFrame:
     """Génère toutes les décades de campagne pour les années civiles données.
 

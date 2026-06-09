@@ -42,8 +42,11 @@ from extraction_gee_helpers import (
     assemble_decades,
     assert_decade_completeness,
     build_decade_calendar,
+    build_decade_calendar_range,
     build_specs,
     compute_chirps_anomaly,
+    parse_decades_range,
+    parse_month_to_decades,
     select_cells,
 )
 from extraction_gee_sources import (
@@ -118,8 +121,9 @@ def _start_export(fcol: ee.FeatureCollection, name: str, selectors: list[str]) -
     return task
 
 
-def submit(years: list[int] = YEARS, baseline: bool = True, dynamic: bool = True,
-           cells: str = "observed", cells_file=None) -> list[ee.batch.Task]:
+def submit(years: list[int] = None, baseline: bool = True, dynamic: bool = True,
+           cells: str = "observed", cells_file=None,
+           decade_range: tuple[int, int, int, int] = None) -> list[ee.batch.Task]:
     """Lance les tâches d'export.
 
     Dynamique : une tâche par (source × **lot d'années** × tuile) — petits lots
@@ -127,13 +131,40 @@ def submit(years: list[int] = YEARS, baseline: bool = True, dynamic: bool = True
     une tâche par tuile (déjà légère). `baseline`/`dynamic` permettent de ne
     relancer qu'une partie (ex. baseline déjà terminée → --no-baseline).
     `cells` restreint la grille (défaut `observed` ≈ cellules labellisées).
+    
+    Args:
+        years: Années civiles à extraire (mutuellement exclusif avec decade_range)
+        decade_range: (year_start, decade_start, year_end, decade_end) pour plage précise
+        baseline: Relancer baseline CHIRPS
+        dynamic: Relancer sources dynamiques
+        cells: Mode de sélection cellules (observed, all, file)
+        cells_file: Fichier pour mode 'file'
     """
     init_gee()
     cells_df = load_cells(cells, cells_file)
     tiles = grid_tiles(cells_df)
-    batches = _year_batches(years)
-    print(f"{len(cells_df)} cellules → {len(tiles)} tuiles de ≤ {POINT_EXPORT_TILE} ; "
-          f"{len(batches)} lots d'années (≤ {YEARS_PER_TASK} ans).")
+    
+    # Construire le calendrier selon le mode
+    if decade_range is not None:
+        y_start, d_start, y_end, d_end = decade_range
+        calendar = build_decade_calendar_range(y_start, d_start, y_end, d_end)
+        years_list = list(range(y_start, y_end + 1))
+        print(f"{len(cells_df)} cellules → {len(tiles)} tuiles ; "
+              f"décades {y_start}-{d_start} à {y_end}-{d_end} ({len(calendar)} décades).")
+    elif years is not None:
+        calendar = build_decade_calendar(years)
+        years_list = years
+        print(f"{len(cells_df)} cellules → {len(tiles)} tuiles ; "
+              f"{len(years)} années → {len(calendar)} décades.")
+    else:
+        raise ValueError("Doit spécifier years ou decade_range")
+    
+    batches = _year_batches(years_list)
+    if decade_range is not None:
+        # Mode --decades ou --month : afficher clairement que seules les décades spécifiées sont extraites
+        print(f"{len(batches)} lot(s) de tâches GEE (les specs filtrent précisément les {len(calendar)} décades).")
+    else:
+        print(f"{len(batches)} lots d'années (≤ {YEARS_PER_TASK} ans).")
 
     tasks: list[ee.batch.Task] = []
 
@@ -150,7 +181,9 @@ def submit(years: list[int] = YEARS, baseline: bool = True, dynamic: bool = True
         for src in DYNAMIC_SOURCES:
             selectors = ["cell_id", "decade_id"] + src["bands"]
             for batch in batches:
-                specs = _flatten_specs(build_specs(build_decade_calendar(batch),
+                # Filtrer le calendrier pour ce batch d'années
+                batch_calendar = calendar[calendar["year"].isin(batch)]
+                specs = _flatten_specs(build_specs(batch_calendar,
                                                    src["lead"], src["lag"]))
                 label = f"y{batch[0]}"
                 for ti, sub in tiles:
@@ -233,24 +266,52 @@ def _load_baseline(exports_dir: Path) -> pd.DataFrame:
     return df.drop(columns=["doy_id"])
 
 
-def assemble(exports_dir: Path = None, years: list[int] = YEARS,
-             cells: str = "observed", cells_file=None) -> None:
+def assemble(exports_dir: Path = None, years: list[int] = None,
+             cells: str = "observed", cells_file=None,
+             decade_range: tuple[int, int, int, int] = None) -> None:
     """Reconstruit la table cellule × décade depuis les CSV exportés, par tuile.
 
     `cells` doit être **identique** à celui passé à `submit` : le tiling est rejoué
     à l'identique pour apparier chaque CSV (`t{ti}`) à son sous-ensemble de cellules.
+    
+    Les nouvelles données sont automatiquement fusionnées avec l'existant :
+    - Les doublons (cell_id, date_start) conservent la version la plus récente
+    - Permet l'accumulation incrémentale (ajout de nouveaux mois sans perte d'historique)
+    
+    Args:
+        exports_dir: Dossier contenant les CSV téléchargés depuis Drive
+        years: Années civiles (mutuellement exclusif avec decade_range)
+        decade_range: (year_start, decade_start, year_end, decade_end) pour plage précise
+        cells: Mode de sélection cellules (observed, all, file)
+        cells_file: Fichier pour mode 'file'
     """
     exports_dir = Path(exports_dir) if exports_dir else PATHS["exports_dir"]
     cells_df = load_cells(cells, cells_file)
     tiles = grid_tiles(cells_df)
-    calendar = build_decade_calendar(years)
+    
+    # Construire le calendrier selon le mode
+    if decade_range is not None:
+        y_start, d_start, y_end, d_end = decade_range
+        calendar = build_decade_calendar_range(y_start, d_start, y_end, d_end)
+        print(f"Assemblage décades {y_start}-{d_start} à {y_end}-{d_end} ({len(calendar)} décades).")
+    elif years is not None:
+        calendar = build_decade_calendar(years)
+        print(f"Assemblage années {years} ({len(calendar)} décades).")
+    else:
+        raise ValueError("Doit spécifier years ou decade_range")
+    
     baseline_df = _load_baseline(exports_dir)
     print(f"Baseline : {len(baseline_df)} lignes ; {len(tiles)} tuiles à assembler.")
 
     out_dir = PATHS["output_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Charger les parquets existants pour fusion incrémentale
+    existing_parts = {}
     for old in out_dir.glob("part-*.parquet"):
-        old.unlink()
+        ti = int(old.stem.split("-")[1])
+        existing_parts[ti] = pd.read_parquet(old)
+        print(f"  Chargé {old.name} : {len(existing_parts[ti])} lignes existantes")
 
     total = 0
     for ti, sub in tiles:
@@ -259,6 +320,15 @@ def assemble(exports_dir: Path = None, years: list[int] = YEARS,
                       for src in DYNAMIC_SOURCES]
         part = assemble_decades(calendar, cells_table(sub), source_dfs)
         part = compute_chirps_anomaly(part, baseline_df)
+
+        # Fusion avec l'existant si disponible
+        if ti in existing_parts:
+            old_part = existing_parts[ti]
+            print(f"  Fusion tuile {ti} : {len(old_part)} anciennes + {len(part)} nouvelles lignes")
+            part = pd.concat([old_part, part], ignore_index=True)
+            # Dédoublonnage : garder la ligne la plus récente (dernière en cas de doublon)
+            part = part.drop_duplicates(subset=["cell_id", "date_start"], keep="last")
+            print(f"  Après dédoublonnage : {len(part)} lignes")
 
         assert_decade_completeness(part, n_cells=len(sub))
 
@@ -273,12 +343,46 @@ def assemble(exports_dir: Path = None, years: list[int] = YEARS,
 # ── Point d'entrée ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pipeline #04b — Extraction GEE par Export.table")
+    parser = argparse.ArgumentParser(
+        description="Pipeline #04b — Extraction GEE par Export.table",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemples d'usage :
+
+  # Extraction par années (historique complet)
+  python src/04b_export_variables_gee.py submit --cells all --years 2001 2002 2003
+
+  # Extraction par mois (opérationnel) avec buffer automatique (2 décades)
+  python src/04b_export_variables_gee.py submit --cells all --month 2026-06 --no-baseline
+
+  # Extraction par mois avec buffer personnalisé
+  python src/04b_export_variables_gee.py submit --cells all --month 2026-06 --buffer 3
+
+  # Extraction par plage de décades (contrôle fin)
+  python src/04b_export_variables_gee.py submit --cells all --decades 2026-14:2026-18 --no-baseline
+
+  # Assemblage (mêmes arguments temporels que submit)
+  python src/04b_export_variables_gee.py assemble --cells all --month 2026-06
+        """
+    )
     parser.add_argument("mode", choices=["submit", "status", "cancel", "assemble"],
                         help="submit: lance les exports ; status: suit ; "
                              "cancel: annule ; assemble: CSV→parquet")
-    parser.add_argument("--years", nargs="+", type=int, default=YEARS,
-                        help="Années civiles (défaut : toute la fenêtre)")
+    
+    # Groupe mutuellement exclusif pour sélection temporelle
+    time_group = parser.add_mutually_exclusive_group()
+    time_group.add_argument("--years", nargs="+", type=int,
+                            help="Années civiles (ex: --years 2025 2026)")
+    time_group.add_argument("--month", type=str,
+                            help="Mois à extraire au format YYYY-MM (ex: --month 2026-06). "
+                                 "Inclut automatiquement le buffer pour les lags.")
+    time_group.add_argument("--decades", type=str,
+                            help="Plage de décades au format YYYY-DD:YYYY-DD "
+                                 "(ex: --decades 2026-14:2026-18). Décades calendaires 1-36.")
+    
+    parser.add_argument("--buffer", type=int, default=2,
+                        help="Nombre de décades avant le mois à inclure pour --month (défaut: 2, "
+                             "profondeur des lags du modèle)")
     parser.add_argument("--cells", choices=["observed", "all", "file"], default="observed",
                         help="Sous-ensemble de cellules (défaut : observed = labellisées). "
                              "Passer la MÊME valeur à submit et assemble.")
@@ -292,13 +396,33 @@ if __name__ == "__main__":
                         help="submit : ne lancer que la baseline")
     args = parser.parse_args()
 
+    # Parser la sélection temporelle
+    decade_range = None
+    years = None
+    
+    if args.month:
+        decade_range = parse_month_to_decades(args.month, buffer=args.buffer)
+        print(f"Mode --month : {args.month} + buffer {args.buffer} décades "
+              f"→ décades {decade_range[0]}-{decade_range[1]} à {decade_range[2]}-{decade_range[3]}")
+    elif args.decades:
+        decade_range = parse_decades_range(args.decades)
+        print(f"Mode --decades : {args.decades} "
+              f"→ décades {decade_range[0]}-{decade_range[1]} à {decade_range[2]}-{decade_range[3]}")
+    elif args.years:
+        years = args.years
+        print(f"Mode --years : {years}")
+    else:
+        # Défaut si aucun argument temporel : utiliser YEARS par défaut
+        years = YEARS
+        print(f"Mode par défaut : années {years[0]}-{years[-1]}")
+
     if args.mode == "submit":
-        submit(years=args.years, baseline=not args.no_baseline, dynamic=not args.no_dynamic,
-               cells=args.cells, cells_file=args.cells_file)
+        submit(years=years, baseline=not args.no_baseline, dynamic=not args.no_dynamic,
+               cells=args.cells, cells_file=args.cells_file, decade_range=decade_range)
     elif args.mode == "status":
         status()
     elif args.mode == "cancel":
         cancel()
     elif args.mode == "assemble":
-        assemble(exports_dir=args.exports_dir, years=args.years,
-                 cells=args.cells, cells_file=args.cells_file)
+        assemble(exports_dir=args.exports_dir, years=years,
+                 cells=args.cells, cells_file=args.cells_file, decade_range=decade_range)
