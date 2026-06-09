@@ -44,6 +44,7 @@ DATA_DIR     = Path(__file__).parent.parent / "data"
 IN_PARQUET   = DATA_DIR / "processed" / "06_table_entrainement_unifiee.parquet"
 IN_CHOIX     = DATA_DIR / "processed" / "07_modele_retenu.txt"
 IN_GRILLE    = DATA_DIR / "processed" / "01_grille_1km.parquet"
+IN_AIRE      = DATA_DIR / "aire_gregarigene"   # contour de contexte (repli hors-ligne)
 
 OUT_DIR              = DATA_DIR / "processed"
 OUT_CARTE_DECADE     = OUT_DIR / "09_carte_severite_decade.csv"
@@ -63,6 +64,7 @@ SEV_COL     = "severite"
 SEV_PRESENCE    = 1   # binaire dérivé : présence = sévérité ≥ 1 (PRD)
 SEV_FOYER       = 2   # foyer à prospecter en priorité = sévérité ≥ 2 (transiens/grégaire)
 DECADES_PAR_MOIS = 3  # mois-campagne = 3 décades consécutives (décade 1–36 → mois 1–12)
+PNG_ALPHA        = 0.75  # transparence des cellules sur le fond de carte (0=invisible, 1=opaque)
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +180,14 @@ def _export_raster(gdf) -> None:
 
 
 def _export_png(gdf) -> None:
-    """Rendu cartographique PNG de la sévérité 0–3."""
+    """Rendu cartographique PNG : cellules de sévérité 0–3 superposées à un fond de carte.
+
+    Les cellules prédites sont tracées en semi-transparence (`PNG_ALPHA`) au-dessus d'un
+    fond de carte web (contextily). Repli automatique hors-ligne : contour de l'aire
+    grégarigène en fond si les tuiles sont indisponibles (`SORTIES_BASEMAP=0` force le repli).
+    """
+    import os
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -187,8 +196,32 @@ def _export_png(gdf) -> None:
     cmap = ListedColormap(["#e8e8e8", "#ffe08a", "#fb8c3c", "#c0202a"])  # 0/1/2/3
     norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
 
+    # Web Mercator (EPSG:3857) requis par les tuiles contextily.
+    gweb = gdf.to_crs(epsg=3857)
+
     fig, ax = plt.subplots(figsize=(9, 11))
-    gdf.plot(column=SEV_COL, cmap=cmap, norm=norm, ax=ax, linewidth=0)
+    gweb.plot(column=SEV_COL, cmap=cmap, norm=norm, ax=ax,
+              linewidth=0, alpha=PNG_ALPHA, zorder=2)
+
+    basemap_ok = False
+    if os.environ.get("SORTIES_BASEMAP", "1") != "0":
+        try:
+            import contextily as cx
+            cx.add_basemap(ax, crs=gweb.crs, source=cx.providers.CartoDB.Positron,
+                           attribution_size=6)
+            basemap_ok = True
+        except Exception as exc:  # noqa: BLE001 — pas de réseau / tuiles : on bascule en repli
+            print(f"  [!] fond de carte web indisponible ({type(exc).__name__}) — repli contour.")
+
+    # Repli / contexte : contour de l'aire grégarigène sous les cellules.
+    if not basemap_ok:
+        try:
+            import geopandas as gpd
+            aire = gpd.read_file(IN_AIRE).to_crs(epsg=3857)
+            aire.boundary.plot(ax=ax, color="#555555", linewidth=0.6, zorder=1)
+        except Exception:  # noqa: BLE001 — le contour est facultatif
+            pass
+
     ax.set_title("Sévérité-phase prédite 0–3 (décade T+1) — aire grégarigène 1 km")
     ax.set_axis_off()
     cbar = fig.colorbar(
@@ -199,7 +232,7 @@ def _export_png(gdf) -> None:
     fig.tight_layout()
     fig.savefig(OUT_PNG, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  -> {OUT_PNG}")
+    print(f"  -> {OUT_PNG}" + ("  (fond de carte web)" if basemap_ok else "  (repli contour)"))
 
 
 # ---------------------------------------------------------------------------

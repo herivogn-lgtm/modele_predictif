@@ -44,7 +44,7 @@ L'outil oriente les prospections vers les cellules à sévérité **2–3** et s
 | `09_agregat_aire_mensuel.csv` | Agrégat mensuel par `AIRE_CODE` (sév max, n cellules, n cellules-foyer) |
 | `09_carte_severite.geojson` | Carte 1 km vectorielle (sévérité par cellule) |
 | `09_carte_severite.tif` | Carte 1 km rasterisée (GeoTIFF, 1 km, nodata 255) |
-| `09_carte_severite.png` | Rendu cartographique (palette 0–3) |
+| `09_carte_severite.png` | Rendu cartographique : cellules 0–3 **superposées à un fond de carte** (contextily / CartoDB), semi-transparentes ; repli sur le contour de l'aire grégarigène si hors-ligne (`SORTIES_BASEMAP=0`) |
 
 ---
 
