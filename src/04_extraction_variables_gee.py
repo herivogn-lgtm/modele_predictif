@@ -52,6 +52,7 @@ from extraction_gee_helpers import (
     build_specs,
     compute_chirps_anomaly,
     parse_reduce_features,
+    select_cells,
 )
 from extraction_gee_sources import (
     BASELINE_KEEP,
@@ -284,13 +285,16 @@ def _prepare_output_dir(out_dir: Path) -> None:
         old.unlink()
 
 
-def run(years: list[int] = YEARS, test_only: bool = False) -> None:
+def run(years: list[int] = YEARS, test_only: bool = False,
+        cells: str = "observed", cells_file=None) -> None:
     print(f"Initialisation GEE...")
     init_gee()
     print("GEE initialisé.")
 
     print(f"Chargement de la grille 1 km : {PATHS['grille_parquet']}")
     cells_df = load_grid(PATHS["grille_parquet"])
+    cells_df = select_cells(cells_df, mode=cells,
+                            labels_path=PATHS["labels_cellule"], cells_file=cells_file)
     print(f"  {len(cells_df)} cellules chargées.")
 
     if test_only:
@@ -338,5 +342,14 @@ if __name__ == "__main__":
         "--years", nargs="+", type=int, default=YEARS,
         help="Années civiles à extraire (ex. --years 2010 2011)"
     )
+    parser.add_argument(
+        "--cells", choices=["observed", "all", "file"], default="observed",
+        help="Sous-ensemble de cellules (défaut : observed = labellisées)"
+    )
+    parser.add_argument(
+        "--cells-file", default=None,
+        help="--cells file : .parquet/.csv listant les cell_id à extraire"
+    )
     args = parser.parse_args()
-    run(years=args.years, test_only=args.test_only)
+    run(years=args.years, test_only=args.test_only,
+        cells=args.cells, cells_file=args.cells_file)

@@ -177,6 +177,66 @@ def test_assemble_decades_merges_multiple_sources():
     assert row["lst_mean"].iloc[0] == 305.0
 
 
+# ── select_cells (sous-ensemble de cellules : observed / all / file) ────────────
+
+def _grid_df():
+    """Grille minuscule, ordre volontairement non trié (vérifie la préservation)."""
+    return pd.DataFrame({
+        "cell_id": ["10_20", "10_21", "10_22", "10_23"],
+        "AIRE_CODE": ["A", "B", "C", "D"],
+        "lon": [1.0, 2.0, 3.0, 4.0],
+        "lat": [1.0, 2.0, 3.0, 4.0],
+    })
+
+
+def _write_labels(tmp_path, ids):
+    p = tmp_path / "labels.parquet"
+    pd.DataFrame({"cell_id": ids, "severite": [1] * len(ids)}).to_parquet(p)
+    return p
+
+
+def test_select_cells_all_returns_grid_unchanged():
+    grid = _grid_df()
+    out = h.select_cells(grid, mode="all")
+    pd.testing.assert_frame_equal(out.reset_index(drop=True), grid)
+
+
+def test_select_cells_observed_filters_to_labels(tmp_path):
+    grid = _grid_df()
+    labels = _write_labels(tmp_path, ["10_21", "10_23"])
+    out = h.select_cells(grid, mode="observed", labels_path=labels)
+    assert list(out["cell_id"]) == ["10_21", "10_23"]
+
+
+def test_select_cells_observed_preserves_grid_order(tmp_path):
+    """Risque #1 : l'ordre suit la grille, pas les labels → tuiles déterministes
+    entre submit et assemble (sinon CSV désappariés)."""
+    grid = _grid_df()
+    labels = _write_labels(tmp_path, ["10_23", "10_20"])  # ordre inverse grille
+    out = h.select_cells(grid, mode="observed", labels_path=labels)
+    assert list(out["cell_id"]) == ["10_20", "10_23"]
+
+
+def test_select_cells_observed_ignores_cells_outside_grid(tmp_path):
+    grid = _grid_df()
+    labels = _write_labels(tmp_path, ["10_21", "99_99"])  # 99_99 hors grille
+    out = h.select_cells(grid, mode="observed", labels_path=labels)
+    assert list(out["cell_id"]) == ["10_21"]
+
+
+def test_select_cells_file_mode_reads_cell_ids(tmp_path):
+    grid = _grid_df()
+    f = tmp_path / "cells.csv"
+    pd.DataFrame({"cell_id": ["10_22", "10_20"]}).to_csv(f, index=False)
+    out = h.select_cells(grid, mode="file", cells_file=f)
+    assert list(out["cell_id"]) == ["10_20", "10_22"]  # ordre grille
+
+
+def test_select_cells_unknown_mode_raises():
+    with pytest.raises(ValueError):
+        h.select_cells(_grid_df(), mode="bogus")
+
+
 # ── assert_decade_completeness (garde-fou) ──────────────────────────────────────
 
 def test_assert_decade_completeness_passes_when_full():

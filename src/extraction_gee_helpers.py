@@ -9,11 +9,67 @@ Importable sans `ee` installé → testable en CI sans authentification.
 
 import calendar
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 
 # Mois de la campagne acridienne : octobre–juillet
 CAMPAIGN_MONTHS = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7]
+
+
+# ── Sélection du sous-ensemble de cellules à extraire ────────────────────────────
+
+def _read_cell_ids(path) -> set[str]:
+    """Lit une colonne `cell_id` depuis un .parquet ou .csv → set de str."""
+    path = Path(path)
+    if path.suffix == ".parquet":
+        col = pd.read_parquet(path, columns=["cell_id"])["cell_id"]
+    else:
+        col = pd.read_csv(path, usecols=["cell_id"])["cell_id"]
+    return set(col.astype(str))
+
+
+def select_cells(cells_df: pd.DataFrame, mode: str = "observed",
+                 labels_path=None, cells_file=None) -> pd.DataFrame:
+    """Restreint la grille (`load_grid`) à un sous-ensemble de cellules.
+
+    L'entraînement n'a besoin que des cellules **observées** (~3 % de la grille) ;
+    la grille complète ne sert qu'à la carte de prédiction T+1. Modes :
+      - ``all``      : grille entière (comportement historique).
+      - ``observed`` : cellules présentes dans `labels_path`
+        (`03_labels_cellule_decade.parquet`), intersectées avec la grille.
+      - ``file``     : cellules listées dans `cells_file` (.parquet/.csv), idem.
+
+    Le filtre est un **masque booléen sur `cells_df`** : l'ordre de la grille est
+    préservé (et non celui des labels), condition nécessaire pour que `grid_tiles`
+    produise des tuiles identiques à `submit` et à `assemble`. Les cellules
+    demandées hors grille (snapping bordure) sont logguées puis ignorées.
+    """
+    if mode == "all":
+        return cells_df
+
+    if mode == "observed":
+        if labels_path is None:
+            raise ValueError("mode 'observed' requiert labels_path")
+        wanted = _read_cell_ids(labels_path)
+    elif mode == "file":
+        if cells_file is None:
+            raise ValueError("mode 'file' requiert cells_file")
+        wanted = _read_cell_ids(cells_file)
+    else:
+        raise ValueError(f"mode de sélection inconnu : {mode!r} "
+                         "(attendu : observed | all | file)")
+
+    grid_ids = set(cells_df["cell_id"].astype(str))
+    outside = wanted - grid_ids
+    if outside:
+        print(f"select_cells({mode}) : {len(outside)} cellule(s) demandée(s) hors "
+              f"grille, ignorée(s) (ex. {sorted(outside)[:3]}).")
+
+    keep = cells_df["cell_id"].astype(str).isin(wanted)
+    selected = cells_df[keep].reset_index(drop=True)
+    print(f"select_cells({mode}) : {len(selected)}/{len(cells_df)} cellules retenues.")
+    return selected
 
 
 def decade_bounds(year: int, month: int, part: int) -> tuple[date, date]:

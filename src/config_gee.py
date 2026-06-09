@@ -18,6 +18,9 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 # pd.read_parquet(<dir>).
 PATHS = {
     "grille_parquet": DATA_DIR / "processed" / "01_grille_1km.parquet",
+    # Labels cellule × décade (issue 03) : définit les cellules **observées**
+    # (~3 % de la grille) = périmètre par défaut de l'extraction d'entraînement.
+    "labels_cellule": DATA_DIR / "processed" / "03_labels_cellule_decade.parquet",
     "output_dir": DATA_DIR / "processed" / "04_variables_environnementales",
     "baseline_cache": DATA_DIR / "processed" / "04_chirps_baseline_cache.parquet",
     # Pipeline 04b : dossier local où l'utilisateur dépose les CSV téléchargés

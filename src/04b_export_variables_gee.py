@@ -44,6 +44,7 @@ from extraction_gee_helpers import (
     build_decade_calendar,
     build_specs,
     compute_chirps_anomaly,
+    select_cells,
 )
 from extraction_gee_sources import (
     BASELINE_KEEP,
@@ -78,6 +79,18 @@ def grid_tiles(cells_df: pd.DataFrame, tile: int = POINT_EXPORT_TILE) -> list[tu
             for ti, i in enumerate(range(0, len(cells_df), tile))]
 
 
+def load_cells(cells: str = "observed", cells_file=None) -> pd.DataFrame:
+    """Grille filtrée selon `--cells` — point d'entrée partagé submit/assemble.
+
+    Doit produire **le même** DataFrame (ordre compris) aux deux étapes pour que
+    `grid_tiles` apparie chaque CSV à ses cellules. `observed` (défaut) ≈ 5 396
+    cellules → 1 tuile, extraction d'entraînement seule.
+    """
+    cells_df = load_grid(PATHS["grille_parquet"])
+    return select_cells(cells_df, mode=cells,
+                        labels_path=PATHS["labels_cellule"], cells_file=cells_file)
+
+
 # ── 1. submit — création et lancement des tâches ─────────────────────────────────
 
 def _flatten_specs(specs_by_year: dict) -> list[dict]:
@@ -105,16 +118,18 @@ def _start_export(fcol: ee.FeatureCollection, name: str, selectors: list[str]) -
     return task
 
 
-def submit(years: list[int] = YEARS, baseline: bool = True, dynamic: bool = True) -> list[ee.batch.Task]:
+def submit(years: list[int] = YEARS, baseline: bool = True, dynamic: bool = True,
+           cells: str = "observed", cells_file=None) -> list[ee.batch.Task]:
     """Lance les tâches d'export.
 
     Dynamique : une tâche par (source × **lot d'années** × tuile) — petits lots
     (`YEARS_PER_TASK`) pour que chaque tâche reste courte/peu coûteuse. Baseline :
     une tâche par tuile (déjà légère). `baseline`/`dynamic` permettent de ne
     relancer qu'une partie (ex. baseline déjà terminée → --no-baseline).
+    `cells` restreint la grille (défaut `observed` ≈ cellules labellisées).
     """
     init_gee()
-    cells_df = load_grid(PATHS["grille_parquet"])
+    cells_df = load_cells(cells, cells_file)
     tiles = grid_tiles(cells_df)
     batches = _year_batches(years)
     print(f"{len(cells_df)} cellules → {len(tiles)} tuiles de ≤ {POINT_EXPORT_TILE} ; "
@@ -218,10 +233,15 @@ def _load_baseline(exports_dir: Path) -> pd.DataFrame:
     return df.drop(columns=["doy_id"])
 
 
-def assemble(exports_dir: Path = None, years: list[int] = YEARS) -> None:
-    """Reconstruit la table cellule × décade depuis les CSV exportés, par tuile."""
+def assemble(exports_dir: Path = None, years: list[int] = YEARS,
+             cells: str = "observed", cells_file=None) -> None:
+    """Reconstruit la table cellule × décade depuis les CSV exportés, par tuile.
+
+    `cells` doit être **identique** à celui passé à `submit` : le tiling est rejoué
+    à l'identique pour apparier chaque CSV (`t{ti}`) à son sous-ensemble de cellules.
+    """
     exports_dir = Path(exports_dir) if exports_dir else PATHS["exports_dir"]
-    cells_df = load_grid(PATHS["grille_parquet"])
+    cells_df = load_cells(cells, cells_file)
     tiles = grid_tiles(cells_df)
     calendar = build_decade_calendar(years)
     baseline_df = _load_baseline(exports_dir)
@@ -259,6 +279,11 @@ if __name__ == "__main__":
                              "cancel: annule ; assemble: CSV→parquet")
     parser.add_argument("--years", nargs="+", type=int, default=YEARS,
                         help="Années civiles (défaut : toute la fenêtre)")
+    parser.add_argument("--cells", choices=["observed", "all", "file"], default="observed",
+                        help="Sous-ensemble de cellules (défaut : observed = labellisées). "
+                             "Passer la MÊME valeur à submit et assemble.")
+    parser.add_argument("--cells-file", default=None,
+                        help="--cells file : .parquet/.csv listant les cell_id à extraire")
     parser.add_argument("--exports-dir", default=None,
                         help="Dossier des CSV téléchargés (défaut : PATHS['exports_dir'])")
     parser.add_argument("--no-baseline", action="store_true",
@@ -268,10 +293,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode == "submit":
-        submit(years=args.years, baseline=not args.no_baseline, dynamic=not args.no_dynamic)
+        submit(years=args.years, baseline=not args.no_baseline, dynamic=not args.no_dynamic,
+               cells=args.cells, cells_file=args.cells_file)
     elif args.mode == "status":
         status()
     elif args.mode == "cancel":
         cancel()
     elif args.mode == "assemble":
-        assemble(exports_dir=args.exports_dir, years=args.years)
+        assemble(exports_dir=args.exports_dir, years=args.years,
+                 cells=args.cells, cells_file=args.cells_file)
