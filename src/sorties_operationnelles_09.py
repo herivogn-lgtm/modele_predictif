@@ -144,7 +144,7 @@ def to_cell_map(carte_decade: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def export_sig(carte_cellule: pd.DataFrame) -> None:
+def export_sig(carte_cellule: pd.DataFrame, titre: str | None = None) -> None:
     """Joint la carte cellule à la géométrie 1 km et exporte GeoJSON + GeoTIFF + PNG."""
     import geopandas as gpd
 
@@ -156,7 +156,7 @@ def export_sig(carte_cellule: pd.DataFrame) -> None:
     print(f"  -> {OUT_GEOJSON} ({len(gdf)} cellules)")
 
     _export_raster(gdf)
-    _export_png(gdf)
+    _export_png(gdf, titre=titre)
 
 
 def _export_raster(gdf) -> None:
@@ -182,7 +182,7 @@ def _export_raster(gdf) -> None:
     print(f"  -> {OUT_RASTER} ({width}×{height} px)")
 
 
-def _export_png(gdf) -> None:
+def _export_png(gdf, titre: str | None = None) -> None:
     """Rendu cartographique PNG : cellules de sévérité 0–3 sur un fond de cartes locales.
 
     Fond de carte = couches locales (pas de tuiles web) : `region_naturelle` (fond gris
@@ -225,7 +225,8 @@ def _export_png(gdf) -> None:
     ax.set_xlim(minx - mx, maxx + mx)
     ax.set_ylim(miny - my, maxy + my)
 
-    ax.set_title("Sévérité-phase prédite 0–3 (décade T+1) — aire grégarigène 1 km")
+    ax.set_title(titre or "Sévérité-phase prédite 0–3 (décade T+1) — aire grégarigène 1 km",
+                 fontsize=11)
     ax.set_axis_off()
     cbar = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
@@ -242,16 +243,16 @@ def _export_png(gdf) -> None:
 # Point d'entrée — entraînement modèle retenu + prédiction décade T+1
 # ---------------------------------------------------------------------------
 
-def _choisir_campagne_cible(a_pred: pd.DataFrame) -> str:
+def _choisir_campagne_cible(a_pred: pd.DataFrame, forcee: str | None = None) -> str:
     """Dernière campagne à prédire ayant une couverture environnementale suffisante.
 
-    Override : variable d'env `SORTIES_CAMPAGNE`. Sinon, on retient la campagne la plus
-    récente dont la couverture de `CLE_COUVERTURE` (NDVI) dépasse `MIN_COUVERTURE_FEATURES` ;
-    à défaut, la plus récente du calendrier (avec avertissement).
+    Override : argument `forcee` (CLI `--campagne`) ou variable d'env `SORTIES_CAMPAGNE`.
+    Sinon, on retient la campagne la plus récente dont la couverture de `CLE_COUVERTURE`
+    (NDVI) dépasse `MIN_COUVERTURE_FEATURES` ; à défaut, la plus récente du calendrier.
     """
     import os
 
-    forcee = os.environ.get("SORTIES_CAMPAGNE", "").strip()
+    forcee = (forcee or os.environ.get("SORTIES_CAMPAGNE", "")).strip()
     campagnes = sorted(a_pred[CAMP_COL].dropna().unique())
     if forcee:
         return forcee
@@ -268,7 +269,14 @@ def _choisir_campagne_cible(a_pred: pd.DataFrame) -> str:
     return campagnes[-1]
 
 
-def run() -> None:
+def run(modele: str | None = None, campagne: str | None = None,
+        decade: int | None = None) -> None:
+    """Génère les cartes de sévérité.
+
+    `modele`   : algorithme à utiliser (CLI `--modele` / env `SORTIES_MODELE`). Défaut #07.
+    `campagne` : campagne cible (CLI `--campagne` / env `SORTIES_CAMPAGNE`).
+    `decade`   : décade de la carte spatiale (CLI `--decade` / env `SORTIES_DECADE`).
+    """
     import os
 
     from benchmark_ordinal_07 import (
@@ -290,14 +298,14 @@ def run() -> None:
     # (La toute dernière campagne du calendrier peut être un futur non encore extrait
     #  par GEE → features 100 % NaN → carte plate. On l'évite, override possible.)
     a_pred = df[df["a_predire"].astype(bool)].copy()
-    campagne_cible = _choisir_campagne_cible(a_pred)
+    campagne_cible = _choisir_campagne_cible(a_pred, campagne)
     pred = a_pred[a_pred[CAMPAIGN_COL] == campagne_cible].copy()
     pred[feature_cols] = pred[feature_cols].fillna(medians)
     print(f"  {len(obs)} lignes observées | campagne cible {campagne_cible} : "
           f"{len(pred)} cellules-décades à prédire")
 
-    # Override manuel possible (prévisualisation d'un autre modèle sans relancer #07).
-    retenu = os.environ.get("SORTIES_MODELE", "").strip() or _lire_modele_retenu(IN_CHOIX)
+    # Modèle : argument CLI > env SORTIES_MODELE > modèle retenu #07.
+    retenu = (modele or os.environ.get("SORTIES_MODELE", "")).strip() or _lire_modele_retenu(IN_CHOIX)
     n_estimators = int(os.environ.get("BENCH_N_ESTIMATORS", "300"))
     n_jobs       = int(os.environ.get("BENCH_N_JOBS", "-1"))
     spec = build_models(n_estimators=n_estimators, n_jobs=n_jobs, include_lstm=True)[retenu]
@@ -321,7 +329,23 @@ def run() -> None:
 
     carte_mois  = to_severity_map(carte_decade)
     aire_mois   = aggregate_by_aire(carte_mois)
-    carte_cell  = to_cell_map(carte_decade)
+
+    # Carte spatiale = UNE décade (la « décade T+1 »), pas le max sur la campagne
+    # (sinon chaque cellule atteint son pire niveau sur la saison → carte saturée).
+    decades = sorted(int(d) for d in carte_decade[DECADE_COL].unique())
+    decade_carte = decade if decade is not None else int(os.environ.get("SORTIES_DECADE", decades[-1]))
+    if decade_carte not in decades:
+        print(f"  [!] décade {decade_carte} absente de la campagne ; repli sur {decades[-1]}.")
+        decade_carte = decades[-1]
+    varies = [d for d in decades
+              if carte_decade.loc[carte_decade[DECADE_COL] == d, SEV_COL].nunique() >= 3]
+    print(f"  Décades à forte variété spatiale (≥3 niveaux) : {varies or '—'}")
+    carte_cell = (
+        carte_decade[carte_decade[DECADE_COL] == decade_carte]
+        [[CELL_COL, AIRE_COL, SEV_COL, "proba_presence"]].copy()
+    )
+    vc = carte_cell[SEV_COL].value_counts().sort_index().to_dict()
+    print(f"  Carte spatiale = décade {decade_carte} : {vc}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     carte_decade.to_csv(OUT_CARTE_DECADE, index=False, encoding="utf-8-sig")
@@ -331,12 +355,30 @@ def run() -> None:
     print(f"  -> {OUT_CARTE_MOIS}")
     print(f"  -> {OUT_AIRE_MOIS}")
 
+    titre = (f"Sévérité-phase prédite 0–3 — {campagne_cible} décade {decade_carte} "
+             f"({retenu}) — aire grégarigène 1 km")
     print("\nExports SIG (GeoJSON + GeoTIFF) + carte PNG…")
-    export_sig(carte_cell)
+    export_sig(carte_cell, titre=titre)
 
     print("\n=== Agrégat mensuel par aire (foyers sév ≥ 2) ===")
     print(aire_mois.sort_values(["AIRE_CODE", "mois_campagne"]).to_string(index=False))
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+
+    MODELES = ["regression_ordinale", "random_forest", "lightgbm",
+               "xgboost", "catboost", "lstm"]
+    parser = argparse.ArgumentParser(
+        description="Pipeline #09 — carte de sévérité-phase 0–3 à 1 km (décade T+1).")
+    parser.add_argument("-m", "--modele", choices=MODELES, metavar="ALGO",
+                        help="Algorithme à utiliser : " + ", ".join(MODELES)
+                             + ". Défaut : modèle retenu (#07).")
+    parser.add_argument("-c", "--campagne", metavar="YYYY-YYYY",
+                        help="Campagne cible (ex. 2025-2026). "
+                             "Défaut : dernière campagne couverte.")
+    parser.add_argument("-d", "--decade", type=int, metavar="N",
+                        help="Décade de la carte spatiale (1–36). "
+                             "Défaut : dernière décade de la campagne.")
+    args = parser.parse_args()
+    run(modele=args.modele, campagne=args.campagne, decade=args.decade)

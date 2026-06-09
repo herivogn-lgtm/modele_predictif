@@ -55,7 +55,7 @@ L'outil oriente les prospections vers les cellules à sévérité **2–3** et s
 | `derive_binary(severite)` | Binaire présence dérivé = (sévérité ≥ 1) |
 | `to_severity_map(carte_decade)` | Agrégation décade → mois ; sévérité mensuelle = **phase max** ; conserve `cell_id` / `AIRE_CODE` |
 | `aggregate_by_aire(carte_mois)` | Agrégat mensuel par `AIRE_CODE` : `{severite_max, n_cellules, n_cellules_foyer (sév ≥ 2)}` |
-| `to_cell_map(carte_decade)` | Réduit la carte décadaire à 1 valeur/cellule (phase max sur la campagne) pour les exports spatiaux |
+| `to_cell_map(carte_decade)` | Variante « pire cas » : réduit la carte décadaire à 1 valeur/cellule (phase max sur la campagne). La carte par défaut utilise plutôt **une décade unique** (`--decade`) pour éviter la saturation. |
 
 `mois_campagne = (campagne_decade − 1) // 3 + 1` (3 décades par mois).
 
@@ -68,12 +68,19 @@ L'orchestration `run()` (non testée) entraîne le modèle retenu sur l'historiq
 ```bash
 ./.venv/bin/python src/sorties_operationnelles_09.py
 
-# Prévisualiser un autre modèle / une autre campagne sans relancer #07 :
-SORTIES_MODELE=catboost SORTIES_CAMPAGNE=2025-2026 ./.venv/bin/python src/sorties_operationnelles_09.py
+# Choisir l'algorithme, la campagne et la décade en ligne de commande :
+./.venv/bin/python src/sorties_operationnelles_09.py --modele catboost --campagne 2025-2026 --decade 19
+./.venv/bin/python src/sorties_operationnelles_09.py -h   # aide
 ```
 
-- **Modèle** : par défaut le modèle retenu (`07_modele_retenu.txt`) ; override via `SORTIES_MODELE` (`catboost`, `random_forest`, `lightgbm`, `xgboost`, `regression_ordinale`, `lstm`).
-- **Campagne cible** : par défaut la **dernière campagne ayant une couverture environnementale suffisante** (NDVI ≥ `MIN_COUVERTURE_FEATURES`, défaut 50 %). La toute dernière campagne du calendrier peut être un **futur non encore extrait par GEE** (features 100 % NaN → carte plate) : elle est automatiquement ignorée. Override via `SORTIES_CAMPAGNE`.
+| Argument CLI | Env équivalent | Défaut |
+|--------------|----------------|--------|
+| `--modele {regression_ordinale,random_forest,lightgbm,xgboost,catboost,lstm}` | `SORTIES_MODELE` | modèle retenu `07_modele_retenu.txt` |
+| `--campagne YYYY-YYYY` | `SORTIES_CAMPAGNE` | dernière campagne couverte (NDVI ≥ `MIN_COUVERTURE_FEATURES`, défaut 50 %) |
+| `--decade N` (1–36) | `SORTIES_DECADE` | dernière décade de la campagne |
+
+- **Carte spatiale = une seule décade** (la « décade T+1 »), **pas** le max sur la campagne — sinon chaque cellule atteint son pire niveau sur la saison et la carte sature en grégaire. Le run affiche les *décades à forte variété spatiale* pour aider au choix de `--decade`.
+- **Campagne cible** : la toute dernière campagne du calendrier peut être un **futur non encore extrait par GEE** (features 100 % NaN → carte plate) ; elle est automatiquement ignorée.
 
 > ⚠️ Un vrai forecast de la campagne future (ex. 2026-2027) nécessite d'abord d'**extraire ses covariables GEE** ([#04](04-extraction-gee.md)). Sans cela, seules les campagnes déjà couvertes produisent une carte exploitable.
 
