@@ -199,8 +199,13 @@ def build_models(
         from lstm_ordinal import LSTMOrdinalRegressor
         return LSTMOrdinalRegressor(random_state=42)
 
+    def _mord_logistic_at():
+        import mord
+        return mord.LogisticAT(alpha=1.0)
+
     models = {
         "regression_ordinale": ModelSpec("regression", 1, _regression_ordinale),
+        "mord_logistic_at":    ModelSpec("regression", 2, _mord_logistic_at),
         "random_forest":       ModelSpec("multiclass", 3, _random_forest),
         "lightgbm":            ModelSpec("multiclass", 4, _lightgbm),
         "xgboost":             ModelSpec("multiclass", 4, _xgboost),
