@@ -7,7 +7,6 @@ pandas==3.0.3
 numpy==2.4.6
 pyarrow==24.0.0            # moteur Parquet (read_parquet / to_parquet)
 xlrd==2.0.2               # lecture du .xls historique (format BIFF8)
-requests==2.34.2          # téléchargement ENSO/ONI (NOAA)
 
 # ── Géospatial ────────────────────────────────────────────────────────────────
 geopandas==1.1.3          # tire shapely + pyproj en dépendances
@@ -16,10 +15,15 @@ geopandas==1.1.3          # tire shapely + pyproj en dépendances
 earthengine-api==1.7.29
 
 # ── Modélisation (pipelines #07/#08/#11) ──────────────────────────────────────
-scikit-learn>=1.5         # non installé dans le venv de référence ; requis par lgbm_baseline_07
+scikit-learn>=1.5         # requis par lgbm_baseline_07 et le benchmark ordinal #07
 lightgbm==4.6.0
+xgboost==3.2.0            # benchmark ordinal #07 (modèle XGBoost)
+catboost==1.2.10          # benchmark ordinal #07 + sorties_operationnelles #09
 joblib==1.5.3
 neuralprophet==0.4.2      # tire torch en dépendance
+
+# ── Visualisation (pipeline #09) ──────────────────────────────────────────────
+matplotlib==3.10.9        # rendu cartographique PNG des sorties opérationnelles
 
 # ── Développement / tests ─────────────────────────────────────────────────────
 pytest==9.0.3
